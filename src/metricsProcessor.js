@@ -281,6 +281,9 @@ function calculateDealerBreakdown(rows) {
 
 export function processRows(rows, metadata = {}) {
   if (!rows || rows.length === 0) throw new Error('No data rows provided');
+
+  const lq = calculateLeadQuality(rows);
+
   return {
     meta: {
       processedAt: new Date().toISOString(),
@@ -295,7 +298,15 @@ export function processRows(rows, metadata = {}) {
     funnel:             calculateFunnel(rows),
     incomeDistribution: calculateIncomeDistribution(rows),
     incomeGroups:       calculateIncomeGroups(rows),
-    leadQuality:        calculateLeadQuality(rows),
+    leadQuality:        lq,
+    dataQuality: {
+      score:                lq.score,
+      totalLeads:           lq.totalLeads,
+      mediumHighConfidence: lq.mediumHighConfidence,
+      withIdNumber:         lq.leadsWithCreditData,
+      withCreditScore:      lq.leadsWithCreditData,
+      confidenceBreakdown:  lq.confidenceBreakdown,
+    },
     intent:             calculateIntent(rows),
     dealerBreakdown:    calculateDealerBreakdown(rows),
     engagement:         metadata.engagement || null,
