@@ -39,14 +39,13 @@ async function fetchRawEvents(env, { startDate, endDate }) {
   const secret = env.MIXPANEL_API_SECRET;
   if (!secret) throw new Error('MIXPANEL_API_SECRET is not set');
 
-  const params = new URLSearchParams({ from_date: startDate, to_date: endDate });
-  const url    = `${EXPORT_URL}?${params}`;
-
+  const params      = new URLSearchParams({ from_date: startDate, to_date: endDate });
+  const url         = `${EXPORT_URL}?${params}`;
   const credentials = btoa(`${secret}:`);
 
   const res = await fetch(url, {
     headers: {
-      Authorization:   `Basic ${credentials}`,
+      Authorization:     `Basic ${credentials}`,
       'Accept-Encoding': 'gzip',
     },
   });
@@ -56,17 +55,30 @@ async function fetchRawEvents(env, { startDate, endDate }) {
     throw new Error(`Mixpanel export failed (${res.status}): ${body}`);
   }
 
-  // Export API returns newline-delimited JSON
-  const text   = await res.text();
-  const events = [];
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      events.push(JSON.parse(trimmed));
-    } catch {
-      // skip malformed lines
+  // Stream line by line to avoid loading all events into memory at once
+  const events  = [];
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // keep incomplete last line in buffer
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try { events.push(JSON.parse(trimmed)); } catch { /* skip */ }
     }
+  }
+
+  // Process any remaining buffer content
+  if (buffer.trim()) {
+    try { events.push(JSON.parse(buffer.trim())); } catch { /* skip */ }
   }
 
   console.log(`[mixpanel] Fetched ${events.length} raw events`);
