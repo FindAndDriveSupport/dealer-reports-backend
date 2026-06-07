@@ -12,4 +12,3 @@ id      = "8e28939fbbe44d019afbd4e774626d32"
 
 [vars]
 CACHE_TTL_MINUTES = "60"
-EOF

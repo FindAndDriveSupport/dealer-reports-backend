@@ -122,6 +122,7 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
         dealerSlug:  slug,
         clientName,
         clientSlug:  slug,
+        financeType:  clientName.toUpperCase() === 'YONDA' ? 'bike' : 'vehicle'
         totalLeads:  analytics.funnel.totalLeads,
         dateRange,
         processedAt: analytics.meta.processedAt,
