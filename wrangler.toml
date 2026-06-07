@@ -1,0 +1,35 @@
+name       = "dealer-reports-backend"
+main       = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# ── KV Namespaces ──────────────────────────────────────────────────────────────
+# Create these first:
+#   wrangler kv:namespace create CACHE
+#   wrangler kv:namespace create TOKENS
+#
+# Then paste the returned IDs below.
+# For local dev, create preview namespaces too:
+#   wrangler kv:namespace create CACHE --preview
+#   wrangler kv:namespace create TOKENS --preview
+
+[[kv_namespaces]]
+binding  = "CACHE"
+id       = "REPLACE_WITH_CACHE_KV_ID"
+preview_id = "REPLACE_WITH_CACHE_KV_PREVIEW_ID"
+
+[[kv_namespaces]]
+binding  = "TOKENS"
+id       = "REPLACE_WITH_TOKENS_KV_ID"
+preview_id = "REPLACE_WITH_TOKENS_KV_PREVIEW_ID"
+
+# ── Environment variables (non-secret) ────────────────────────────────────────
+# Secrets are set separately via `wrangler secret put` — never commit them here
+
+[vars]
+CACHE_TTL_MINUTES = "60"
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+# Uncomment and update once you have a custom domain on Cloudflare:
+# [[routes]]
+# pattern = "api.findndrive.co.za/*"
+# zone_name = "findndrive.co.za"
