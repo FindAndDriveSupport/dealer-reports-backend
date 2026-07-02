@@ -21,11 +21,13 @@
  *   EMAIL_FROM
  *   EMAIL_FROM_NAME
  *   EMAIL_API_KEY
+ *   SUPABASE_JWT_SECRET  ← Supabase dashboard > Settings > API > JWT Secret
  */
 
 import { handleReport }   from './report.js';
 import { handleMixpanel } from './mixpanel.js';
 import { handleEmail }    from './email.js';
+import { withAuth }       from './middleware/auth.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -41,14 +43,14 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin':  corsOk ? origin : allowed[0],
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, x-webhook-secret',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-webhook-secret',
     };
 
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // ── Health ────────────────────────────────────────────────────────────────
+    // ── Health (public — no auth required) ───────────────────────────────────
     if (path === '/health' && method === 'GET') {
       return json({
         status:    'ok',
@@ -64,11 +66,21 @@ export default {
       let response;
 
       if (path.startsWith('/api/report')) {
-        response = await handleReport(request, env, path, method);
+        // Protected — dealer JWT required. withAuth verifies the token and
+        // injects a `dealer` object (dealerId, dealerName, financeType) as
+        // the fourth argument to the inner handler.
+        response = await withAuth(
+          (req, e, c, dealer) => handleReport(req, e, path, method, dealer)
+        )(request, env, ctx);
+
       } else if (path.startsWith('/api/mixpanel')) {
-        response = await handleMixpanel(request, env, path, method);
+        response = await withAuth(
+          (req, e, c, dealer) => handleMixpanel(req, e, path, method, dealer)
+        )(request, env, ctx);
+
       } else if (path.startsWith('/api/email')) {
         response = await handleEmail(request, env, path, method);
+
       } else {
         response = json({ error: 'Not found' }, 404);
       }
