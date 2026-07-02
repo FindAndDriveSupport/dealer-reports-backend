@@ -6,6 +6,11 @@
  * Fetches raw event data from the Mixpanel Export API and processes it
  * into the EngagementData shape the frontend expects.
  *
+ * The `dealer` object is injected by withAuth() middleware and contains:
+ *   dealer.dealerId    — verified dealer slug (e.g. "yonda")
+ *   dealer.dealerName  — display name
+ *   dealer.financeType — "vehicle" | "bike"
+ *
  * Env vars:
  *   MIXPANEL_API_SECRET   — Project API secret (Access Keys)
  *   MIXPANEL_PROJECT_ID   — Project ID (not used in export API but kept for reference)
@@ -55,7 +60,6 @@ async function fetchRawEvents(env, { startDate, endDate }) {
     throw new Error(`Mixpanel export failed (${res.status}): ${body}`);
   }
 
-  // Stream line by line to avoid loading all events into memory at once
   const events  = [];
   const reader  = res.body.getReader();
   const decoder = new TextDecoder();
@@ -67,7 +71,7 @@ async function fetchRawEvents(env, { startDate, endDate }) {
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
-    buffer = lines.pop(); // keep incomplete last line in buffer
+    buffer = lines.pop();
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -76,7 +80,6 @@ async function fetchRawEvents(env, { startDate, endDate }) {
     }
   }
 
-  // Process any remaining buffer content
   if (buffer.trim()) {
     try { events.push(JSON.parse(buffer.trim())); } catch { /* skip */ }
   }
@@ -92,7 +95,6 @@ function filterByDealer(events, dealerSlug) {
 
   return events.filter(e => {
     const url = e.properties?.current_url_search || e.properties?.['$current_url'] || '';
-    // Match by branchCode param or by dealer slug in URL
     const branchMatch = Object.entries(BRANCH_TO_SLUG).some(
       ([code, slug]) => slug === dealerSlug && url.includes(code)
     );
@@ -158,10 +160,10 @@ function processEvents(events) {
     .slice(0, 10);
 
   // ── Return rate ─────────────────────────────────────────────────────────────
-  const distinctIds   = base.map(e => e.properties?.distinct_id).filter(Boolean);
+  const distinctIds    = base.map(e => e.properties?.distinct_id).filter(Boolean);
   const uniqueVisitors = new Set(distinctIds).size;
-  const returning     = distinctIds.length - uniqueVisitors;
-  const returnRate    = uniqueVisitors > 0
+  const returning      = distinctIds.length - uniqueVisitors;
+  const returnRate     = uniqueVisitors > 0
     ? +((returning / distinctIds.length) * 100).toFixed(1)
     : 0;
 
@@ -189,7 +191,7 @@ function processEvents(events) {
 
   // ── Peak hours ──────────────────────────────────────────────────────────────
   const peakHours = DAYS.map(day => {
-    const hours = heatmap.find(h => h.day === day)?.hours || [];
+    const hours   = heatmap.find(h => h.day === day)?.hours || [];
     const amHours = hours.filter(h => h.hour < 12).sort((a, b) => b.count - a.count);
     const pmHours = hours.filter(h => h.hour >= 12).sort((a, b) => b.count - a.count);
     const amPeak  = amHours[0];
@@ -218,21 +220,21 @@ function processEvents(events) {
 
 function classifyReferrer(referrer) {
   if (!referrer || referrer === '$direct' || referrer === 'direct') return 'Direct';
-  if (referrer.includes('google'))   return 'Google';
+  if (referrer.includes('google'))    return 'Google';
   if (referrer.includes('facebook') || referrer.includes('fb.')) return 'Facebook';
   if (referrer.includes('instagram')) return 'Instagram';
-  if (referrer.includes('tiktok'))   return 'TikTok';
+  if (referrer.includes('tiktok'))    return 'TikTok';
   if (referrer.includes('twitter') || referrer.includes('x.com')) return 'Twitter/X';
-  if (referrer.includes('linkedin')) return 'LinkedIn';
-  if (referrer.includes('whatsapp')) return 'WhatsApp';
+  if (referrer.includes('linkedin'))  return 'LinkedIn';
+  if (referrer.includes('whatsapp'))  return 'WhatsApp';
   if (referrer.includes('email') || referrer.includes('mail')) return 'Email';
   return 'Other';
 }
 
 function classifyDevice(device, os, userAgent) {
   const ua  = (userAgent || '').toLowerCase();
-  const dev = (device   || '').toLowerCase();
-  const osl = (os       || '').toLowerCase();
+  const dev = (device    || '').toLowerCase();
+  const osl = (os        || '').toLowerCase();
 
   if (dev === 'spider' || ua.includes('bot') || ua.includes('spider')) return 'desktop';
   if (dev === 'tablet' || ua.includes('tablet') || ua.includes('ipad')) return 'tablet';
@@ -262,7 +264,7 @@ function defaultDateRange() {
 
 // ─── Main route handler ───────────────────────────────────────────────────────
 
-export async function handleMixpanel(request, env, path, method) {
+export async function handleMixpanel(request, env, path, method, dealer) {
   if (method !== 'GET') return json({ error: 'Method not allowed' }, 405);
 
   const url         = new URL(request.url);
@@ -273,14 +275,15 @@ export async function handleMixpanel(request, env, path, method) {
     ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
     : defaultDateRange();
 
-  // GET /api/mixpanel/raw — debug endpoint
+  // GET /api/mixpanel/raw — debug endpoint (scoped to authenticated dealer)
   if (subPath === '/raw') {
     try {
-      const events = await fetchRawEvents(env, dates);
+      const events   = await fetchRawEvents(env, dates);
+      const filtered = filterByDealer(events, dealer.dealerId);
       return json({
-        totalEvents: events.length,
-        eventTypes:  [...new Set(events.map(e => e.event))].slice(0, 20),
-        sample:      events.slice(0, 2),
+        totalEvents: filtered.length,
+        eventTypes:  [...new Set(filtered.map(e => e.event))].slice(0, 20),
+        sample:      filtered.slice(0, 2),
       });
     } catch (err) {
       return json({ error: err.message }, 502);
@@ -288,21 +291,26 @@ export async function handleMixpanel(request, env, path, method) {
   }
 
   // GET /api/mixpanel/:dealerSlug
+  // Security: ignore the URL slug entirely — always use dealer.dealerId from the JWT.
   const slugMatch = subPath.match(/^\/([a-z0-9-]+)$/);
   if (slugMatch) {
-    const dealerSlug = slugMatch[1];
+    const requestedSlug = slugMatch[1];
 
-    // Check KV cache first
-    const cacheKey = `mixpanel:${dealerSlug}:${dates.startDate}:${dates.endDate}`;
+    // Reject if dealer is trying to access another dealer's data
+    if (requestedSlug !== dealer.dealerId) {
+      return json({ error: 'Forbidden — you can only access your own engagement data' }, 403);
+    }
+
+    const cacheKey = `mixpanel:${dealer.dealerId}:${dates.startDate}:${dates.endDate}`;
     try {
       const cached = await env.CACHE.get(cacheKey);
       if (cached) return json({ ...JSON.parse(cached), _cached: true });
     } catch { /* cache miss */ }
 
     try {
-      const allEvents     = await fetchRawEvents(env, dates);
-      const filtered      = filterByDealer(allEvents, dealerSlug);
-      const engagement    = processEvents(filtered);
+      const allEvents  = await fetchRawEvents(env, dates);
+      const filtered   = filterByDealer(allEvents, dealer.dealerId);
+      const engagement = processEvents(filtered);
 
       await env.CACHE.put(cacheKey, JSON.stringify(engagement), {
         expirationTtl: CACHE_TTL,
