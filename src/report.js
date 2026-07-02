@@ -2,10 +2,15 @@
  * report.js — Cloudflare Worker edition
  *
  * Handles all /api/report/* routes.
- * No Express — receives (request, env, path, method) from index.js router.
+ * No Express — receives (request, env, path, method, dealer) from index.js router.
+ *
+ * The `dealer` object is injected by withAuth() middleware and contains:
+ *   dealer.dealerId    — verified dealer slug (e.g. "yonda")
+ *   dealer.dealerName  — display name
+ *   dealer.financeType — "vehicle" | "bike"
  *
  * Cache strategy: Cloudflare KV (env.CACHE)
- *   Key "master:index"         → dealer index
+ *   Key "master:index"           → dealer index
  *   Key "dealer:{client}:{slug}" → full analytics JSON per dealer
  *   TTL: CACHE_TTL_MINUTES env var (default 60 min)
  *
@@ -44,7 +49,6 @@ async function cacheSet(env, key, value) {
 }
 
 async function cacheBust(env) {
-  // KV doesn't support bulk delete — list and delete all keys
   const listed = await env.CACHE.list();
   await Promise.all(listed.keys.map(k => env.CACHE.delete(k.name)));
 }
@@ -122,7 +126,7 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
         dealerSlug:  slug,
         clientName,
         clientSlug:  slug,
-        financeType:  clientName.toUpperCase() === 'YONDA' ? 'bike' : 'vehicle'
+        financeType:  clientName.toUpperCase() === 'YONDA' ? 'bike' : 'vehicle',
         totalLeads:  analytics.funnel.totalLeads,
         dateRange,
         processedAt: analytics.meta.processedAt,
@@ -151,7 +155,7 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
 
 // ─── Main route handler ───────────────────────────────────────────────────────
 
-export async function handleReport(request, env, path, method) {
+export async function handleReport(request, env, path, method, dealer) {
   const url         = new URL(request.url);
   const subPath     = path.replace('/api/report', '') || '/';
   const queryParams = Object.fromEntries(url.searchParams);
@@ -163,22 +167,34 @@ export async function handleReport(request, env, path, method) {
   }
 
   // GET /api/report/index
+  // Dealers only see their own entry in the index, not all dealers.
   if (subPath === '/index' && method === 'GET') {
     const cached = await cacheGet(env, 'master:index');
-    if (cached) return json({ ...cached, _cached: true });
 
-    await fetchAndProcessAll(env, {
-      startDate: queryParams.startDate,
-      endDate:   queryParams.endDate,
-    });
+    if (!cached) {
+      await fetchAndProcessAll(env, {
+        startDate: queryParams.startDate,
+        endDate:   queryParams.endDate,
+      });
+    }
 
     const index = await cacheGet(env, 'master:index');
     if (!index) return json({ error: 'Failed to build dealer index from Seriti API' }, 502);
 
-    return json({ ...index, _cached: false });
+    // Scope: dealer only sees their own record
+    const dealerEntry = index.dealers.find(d => d.dealerSlug === dealer.dealerId);
+    const scopedIndex = {
+      ...index,
+      dealers:      dealerEntry ? [dealerEntry] : [],
+      totalDealers: dealerEntry ? 1 : 0,
+      totalClients: dealerEntry ? 1 : 0,
+      _cached:      !!cached,
+    };
+
+    return json(scopedIndex);
   }
 
-  // POST /api/report/refresh
+  // POST /api/report/refresh — still webhook-secret protected, not dealer-facing
   if (subPath === '/refresh' && method === 'POST') {
     const secret = env.WEBHOOK_SECRET;
     if (secret && request.headers.get('x-webhook-secret') !== secret) {
@@ -204,12 +220,18 @@ export async function handleReport(request, env, path, method) {
   }
 
   // GET /api/report/:clientSlug/:dealerSlug
+  // Enforce that the requested slug matches the authenticated dealer.
   const slugMatch = subPath.match(/^\/([a-z0-9-]+)\/([a-z0-9-]+)$/);
   if (slugMatch && method === 'GET') {
     const [, clientSlug, dSlug] = slugMatch;
 
     if (!SLUG_RE.test(clientSlug) || !SLUG_RE.test(dSlug)) {
       return json({ error: 'Invalid slug format' }, 400);
+    }
+
+    // Security: reject if the requested dealer slug doesn't match the JWT
+    if (dSlug !== dealer.dealerId) {
+      return json({ error: 'Forbidden — you can only access your own dealer report' }, 403);
     }
 
     const CACHE_KEY = `dealer:${clientSlug}:${dSlug}`;
