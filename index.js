@@ -7,7 +7,7 @@
  *   MIXPANEL_SERVICE_ACCOUNT_USERNAME, MIXPANEL_SERVICE_ACCOUNT_SECRET, MIXPANEL_PROJECT_ID
  *   EMAIL_PROVIDER, EMAIL_FROM, EMAIL_FROM_NAME, EMAIL_API_KEY
  *   SUPABASE_JWT_SECRET
- *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  ← for admin routes
+ *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
  */
 
 import { handleReport }   from './report.js';
@@ -16,13 +16,19 @@ import { handleEmail }    from './email.js';
 import { handleAdmin }    from './admin.js';
 import { withAuth }       from './middleware/auth.js';
 
+const ADMIN_EMAILS = [
+  'mpho@findndrive.co.za',
+  'luzuko@findndrive.co.za',
+  'anric@seritisolutions.com',
+  'liezels@seritisolutions.com',
+];
+
 export default {
   async fetch(request, env, ctx) {
     const url    = new URL(request.url);
     const path   = url.pathname;
     const method = request.method;
 
-    // ── CORS ──────────────────────────────────────────────────────────────────
     const origin  = request.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGINS || '*').split(',').map(o => o.trim());
     const corsOk  = allowed.includes('*') || allowed.includes(origin);
@@ -37,7 +43,6 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // ── Health (public) ───────────────────────────────────────────────────────
     if (path === '/health' && method === 'GET') {
       return json({
         status:    'ok',
@@ -48,12 +53,23 @@ export default {
       }, 200, corsHeaders);
     }
 
-    // ── Route dispatch ────────────────────────────────────────────────────────
+    // Refresh — admin JWT required, not scoped to a single dealer
+    if (path === '/api/report/refresh' && method === 'POST') {
+      const response = await withAuth(async (req, e, c, dealer) => {
+        if (!ADMIN_EMAILS.includes((dealer.email || '').toLowerCase())) {
+          return json({ error: 'Forbidden — admin access only' }, 403);
+        }
+        return handleReport(req, e, path, method, dealer);
+      })(request, env, ctx);
+      const headers = new Headers(response.headers);
+      Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
+      return new Response(response.body, { status: response.status, headers });
+    }
+
     try {
       let response;
 
       if (path.startsWith('/api/admin')) {
-        // Admin routes — JWT required + admin email check inside handleAdmin
         response = await withAuth(
           (req, e, c, dealer) => handleAdmin(req, e, path, method, dealer)
         )(request, env, ctx);
@@ -75,7 +91,6 @@ export default {
         response = json({ error: 'Not found' }, 404);
       }
 
-      // Attach CORS headers to every response
       const headers = new Headers(response.headers);
       Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
       return new Response(response.body, { status: response.status, headers });
