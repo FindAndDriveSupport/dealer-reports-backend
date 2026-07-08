@@ -130,6 +130,8 @@ function calculateIncomeGroups(rows) {
   });
 }
 
+// ─── Scoring functions ────────────────────────────────────────────────────────
+
 function getGrade(score) {
   if (score >= 80) return 'A';
   if (score >= 65) return 'B';
@@ -138,6 +140,7 @@ function getGrade(score) {
   return 'F';
 }
 
+// Traffic quality dimensions
 function scoreConfidence(pct) {
   if (pct >= 70) return 100;
   if (pct >= 50) return 70;
@@ -145,6 +148,14 @@ function scoreConfidence(pct) {
   return 10;
 }
 
+function scoreApplicationCompletion(pct) {
+  if (pct >= 60) return 100;
+  if (pct >= 40) return 75;
+  if (pct >= 20) return 45;
+  return 15;
+}
+
+// Applicant quality dimensions
 function scoreCreditScore(avg) {
   if (!avg || avg === 0) return 10;
   if (avg >= 700) return 100;
@@ -163,97 +174,400 @@ function scoreDebtLevel(avgDti) {
   return 10;
 }
 
-const RECOMMENDATIONS = {
-  predictorConfidence: {
-    A: 'Your traffic is generating well-validated leads. Maintain current acquisition channels and consider scaling spend on top-performing sources.',
-    B: 'Good data coverage with room to improve. Review form completion rates — shorter qualification flows tend to improve predictor confidence. Contact your Seriti Account Exec for guidance.',
-    C: 'A significant portion of leads lack bureau validation. Improve landing page quality and form UX to capture more complete applicant data. Contact your Seriti Account Exec for assistance.',
-    D: 'Low predictor confidence suggests poor-quality traffic. Review your ad targeting and keyword strategy to attract higher-intent visitors. Contact your Seriti Account Exec for assistance.',
-    F: 'Critical — most leads cannot be assessed by the bureau. Prioritise improving traffic quality through SEO optimisation and ad audience refinement. Reach out to your Seriti Account Exec immediately.',
-  },
-  creditScore: {
-    A: 'Strong credit profile across your lead pool. Your targeting is reaching financially healthy consumers — maintain your current audience strategy.',
-    B: 'Above-average credit quality. Consider refining ad targeting toward higher-income brackets to further improve approval rates. Contact your Seriti Account Exec for guidance.',
-    C: 'Average credit scores are limiting approval rates. Review your audience targeting — shift spend toward income and lifestyle segments that correlate with better creditworthiness. Contact your Seriti Account Exec for assistance.',
-    D: 'Below-average credit profile. Your current traffic sources may be attracting consumers outside typical approval bands. A full audience and channel review is recommended. Contact your Seriti Account Exec for assistance.',
-    F: 'Very low average credit scores indicate a significant targeting misalignment. Pause underperforming campaigns and work with your Seriti Account Exec to restructure your digital strategy immediately.',
-  },
-  debtLevel: {
-    A: 'Low debt burden across your lead pool — strong indicator of affordability. Your audience targeting is well-aligned to qualifying consumers.',
-    B: 'Manageable debt levels with some room to improve. Consider promoting your finance offering to younger or early-career audiences with lower existing debt commitments. Contact your Seriti Account Exec for guidance.',
-    C: 'Moderate debt levels are reducing affordability scores. Review whether your creative and messaging is attracting consumers already carrying significant financial commitments. Contact your Seriti Account Exec for assistance.',
-    D: 'High average debt burden is limiting approvals. A shift in audience targeting toward lower-debt consumer segments is recommended. Contact your Seriti Account Exec for assistance.',
-    F: 'Very high debt levels across your lead pool. Current traffic is unlikely to meet affordability requirements. Immediate campaign review and retargeting strategy recommended. Reach out to your Seriti Account Exec immediately.',
-  },
-};
+function scoreIncomeProfile(avgIncome) {
+  if (!avgIncome || avgIncome === 0) return 10;
+  if (avgIncome >= 40000) return 100;
+  if (avgIncome >= 25000) return 80;
+  if (avgIncome >= 18000) return 55;
+  if (avgIncome >= 11000) return 30;
+  return 10;
+}
 
-function calculateLeadQuality(rows) {
+// ─── Next threshold simulation (for estimated score gain) ────────────────────
+
+function nextThreshold(scoreFn, currentValue, steps) {
+  for (const threshold of steps) {
+    if (currentValue < threshold) {
+      return { value: threshold, score: scoreFn(threshold) };
+    }
+  }
+  return null;
+}
+
+const CONFIDENCE_THRESHOLDS    = [30, 50, 70];
+const COMPLETION_THRESHOLDS    = [20, 40, 60];
+const CREDIT_THRESHOLDS        = [550, 600, 650, 700];
+const DTI_THRESHOLDS           = [60, 50, 40, 30]; // descending — lower is better
+const INCOME_THRESHOLDS        = [11000, 18000, 25000, 40000];
+
+function simulateGain(currentComposite, currentDimScore, weight, nextDimScore) {
+  const gain = (nextDimScore - currentDimScore) * weight;
+  return Math.round(gain);
+}
+
+// ─── Insight engine ───────────────────────────────────────────────────────────
+
+/**
+ * Generates ranked, threshold-based marketing insights.
+ * All recommendations are framed from the dealer/marketer perspective —
+ * audience targeting, campaign spend, channel mix.
+ */
+function generateInsights({
+  confidencePct,
+  completionPct,
+  avgCreditScore,
+  avgDti,
+  avgIncome,
+  trafficScore,
+  applicantScore,
+  overallScore,
+  trafficWeights,
+  applicantWeights,
+}) {
+  const insights = [];
+
+  // ── Traffic: bureau confidence ────────────────────────────────────────────
+  const confScore = scoreConfidence(confidencePct);
+  const confNext  = nextThreshold(scoreConfidence, confidencePct, CONFIDENCE_THRESHOLDS);
+  if (confNext) {
+    const gain = simulateGain(overallScore, confScore, trafficWeights.confidence, confNext.score);
+    insights.push({
+      severity:        gain >= 10 ? 'high' : gain >= 5 ? 'medium' : 'low',
+      category:        'Traffic quality',
+      dimension:       'bureauConfidence',
+      title:           'Low bureau verification rate',
+      finding:         `Only ${confidencePct.toFixed(1)}% of your leads could be credit-assessed by the bureau.`,
+      impact:          'Leads that can\'t be assessed can\'t be pre-approved, reducing your overall conversion rate.',
+      recommendation:  'This typically indicates low-intent traffic. Review your highest-volume campaigns and consider pausing those with high click-through but low completion rates. Shifting budget toward intent-based keywords and targeted demographic audiences tends to improve verification rates.',
+      currentValue:    +confidencePct.toFixed(1),
+      targetValue:     confNext.value,
+      currentLabel:    `${confidencePct.toFixed(1)}% verified`,
+      targetLabel:     `${confNext.value}% verified`,
+      estimatedGain:   gain,
+      estimatedScore:  overallScore + gain,
+    });
+  }
+
+  // ── Traffic: application completion ──────────────────────────────────────
+  const compScore = scoreApplicationCompletion(completionPct);
+  const compNext  = nextThreshold(scoreApplicationCompletion, completionPct, COMPLETION_THRESHOLDS);
+  if (compNext) {
+    const gain = simulateGain(overallScore, compScore, trafficWeights.completion, compNext.score);
+    insights.push({
+      severity:        gain >= 10 ? 'high' : gain >= 5 ? 'medium' : 'low',
+      category:        'Traffic quality',
+      dimension:       'applicationCompletion',
+      title:           'Low application completion rate',
+      finding:         `Only ${completionPct.toFixed(1)}% of leads completed a full application.`,
+      impact:          'Incomplete applications can\'t be submitted for finance, directly limiting funded deals.',
+      recommendation:  'Consider whether your ads are setting accurate expectations about the application process. Traffic from broad awareness campaigns tends to have lower intent and higher drop-off. Retargeting warm audiences or focusing on bottom-of-funnel keywords typically improves completion rates.',
+      currentValue:    +completionPct.toFixed(1),
+      targetValue:     compNext.value,
+      currentLabel:    `${completionPct.toFixed(1)}% completed`,
+      targetLabel:     `${compNext.value}% completed`,
+      estimatedGain:   gain,
+      estimatedScore:  overallScore + gain,
+    });
+  }
+
+  // ── Applicant: credit score ───────────────────────────────────────────────
+  if (avgCreditScore > 0) {
+    const credScore = scoreCreditScore(avgCreditScore);
+    const credNext  = nextThreshold(scoreCreditScore, avgCreditScore, CREDIT_THRESHOLDS);
+    if (credNext) {
+      const gain = simulateGain(overallScore, credScore, applicantWeights.credit, credNext.score);
+      insights.push({
+        severity:        gain >= 10 ? 'high' : gain >= 5 ? 'medium' : 'low',
+        category:        'Applicant quality',
+        dimension:       'creditScore',
+        title:           'Below-average credit profile',
+        finding:         `Average credit score across your leads is ${Math.round(avgCreditScore)}.`,
+        impact:          'Lower credit scores reduce approval probability, meaning fewer funded deals from the same lead volume.',
+        recommendation:  `Your current audiences may include consumers who fall outside typical approval ranges. Consider shifting ad spend toward employed, higher-income demographics. Reviewing which campaigns produce the lowest credit scores and reallocating that budget to better-performing sources is likely to improve this metric.`,
+        currentValue:    Math.round(avgCreditScore),
+        targetValue:     credNext.value,
+        currentLabel:    `Avg ${Math.round(avgCreditScore)}`,
+        targetLabel:     `Target ${credNext.value}+`,
+        estimatedGain:   gain,
+        estimatedScore:  overallScore + gain,
+      });
+    }
+  }
+
+  // ── Applicant: DTI ────────────────────────────────────────────────────────
+  if (avgDti > 0) {
+    const dtiScore = scoreDebtLevel(avgDti);
+    // DTI is inverse — lower is better, so thresholds go downward
+    const dtiNext = DTI_THRESHOLDS.find(t => avgDti > t)
+      ? { value: DTI_THRESHOLDS.find(t => avgDti > t), score: scoreDebtLevel(DTI_THRESHOLDS.find(t => avgDti > t)) }
+      : null;
+    if (dtiNext) {
+      const gain = simulateGain(overallScore, dtiScore, applicantWeights.debt, dtiNext.score);
+      insights.push({
+        severity:        gain >= 10 ? 'high' : gain >= 5 ? 'medium' : 'low',
+        category:        'Applicant quality',
+        dimension:       'debtLevel',
+        title:           'High existing debt burden',
+        finding:         `Average debt-to-income ratio across your leads is ${avgDti.toFixed(1)}%.`,
+        impact:          'High existing commitments reduce affordability, limiting the loan amounts that can be approved.',
+        recommendation:  'Your audiences may be skewing toward consumers already carrying significant financial obligations. Reviewing audience demographics — particularly age groups, employment type, and income bands — and adjusting targeting toward lower-debt segments can improve this metric over time.',
+        currentValue:    +avgDti.toFixed(1),
+        targetValue:     dtiNext.value,
+        currentLabel:    `Avg DTI ${avgDti.toFixed(1)}%`,
+        targetLabel:     `Target DTI <${dtiNext.value}%`,
+        estimatedGain:   gain,
+        estimatedScore:  overallScore + gain,
+      });
+    }
+  }
+
+  // ── Applicant: income profile ─────────────────────────────────────────────
+  if (avgIncome > 0) {
+    const incScore = scoreIncomeProfile(avgIncome);
+    const incNext  = nextThreshold(scoreIncomeProfile, avgIncome, INCOME_THRESHOLDS);
+    if (incNext) {
+      const gain = simulateGain(overallScore, incScore, applicantWeights.income, incNext.score);
+      insights.push({
+        severity:        gain >= 5 ? 'medium' : 'low',
+        category:        'Applicant quality',
+        dimension:       'incomeProfile',
+        title:           'Lower-income audience profile',
+        finding:         `Average net income across your leads is R${Math.round(avgIncome).toLocaleString('en-ZA')}/month.`,
+        impact:          'Lower income levels reduce estimated approval amounts, limiting deals to lower-value vehicles.',
+        recommendation:  'Consider whether your creative and messaging is resonating with employed, middle-income consumers. Platforms like LinkedIn and targeted Google Display audiences with household income filters can help shift the income profile of incoming leads.',
+        currentValue:    Math.round(avgIncome),
+        targetValue:     incNext.value,
+        currentLabel:    `Avg R${Math.round(avgIncome / 1000)}k/mo`,
+        targetLabel:     `Target R${Math.round(incNext.value / 1000)}k+/mo`,
+        estimatedGain:   gain,
+        estimatedScore:  overallScore + gain,
+      });
+    }
+  }
+
+  // ── Positive findings (dimensions already performing well) ────────────────
+  if (confidencePct >= 70) {
+    insights.push({
+      severity:        'positive',
+      category:        'Traffic quality',
+      dimension:       'bureauConfidence',
+      title:           'Strong bureau verification rate',
+      finding:         `${confidencePct.toFixed(1)}% of your leads are bureau-verifiable — well above average.`,
+      impact:          'High verification rates mean more leads can be assessed and pre-approved.',
+      recommendation:  'Your traffic is generating high-intent, assessable leads. Identify which campaigns are driving this quality and consider scaling spend on those sources.',
+      currentValue:    +confidencePct.toFixed(1),
+      targetValue:     null,
+      currentLabel:    `${confidencePct.toFixed(1)}% verified`,
+      targetLabel:     null,
+      estimatedGain:   0,
+      estimatedScore:  overallScore,
+    });
+  }
+
+  if (avgCreditScore >= 650) {
+    insights.push({
+      severity:        'positive',
+      category:        'Applicant quality',
+      dimension:       'creditScore',
+      title:           'Strong credit profile',
+      finding:         `Average credit score of ${Math.round(avgCreditScore)} indicates a well-qualified audience.`,
+      impact:          'Higher credit scores directly improve approval rates and funded deal volume.',
+      recommendation:  'Your targeting is reaching financially healthy consumers. Maintain your current audience strategy and look for ways to scale the channels producing this quality.',
+      currentValue:    Math.round(avgCreditScore),
+      targetValue:     null,
+      currentLabel:    `Avg ${Math.round(avgCreditScore)}`,
+      targetLabel:     null,
+      estimatedGain:   0,
+      estimatedScore:  overallScore,
+    });
+  }
+
+  // Sort: high severity first, then by estimated gain descending
+  const severityOrder = { high: 0, medium: 1, low: 2, positive: 3 };
+  insights.sort((a, b) => {
+    if (severityOrder[a.severity] !== severityOrder[b.severity]) {
+      return severityOrder[a.severity] - severityOrder[b.severity];
+    }
+    return b.estimatedGain - a.estimatedGain;
+  });
+
+  return insights;
+}
+
+// ─── Traffic quality ──────────────────────────────────────────────────────────
+
+function calculateTrafficQuality(rows) {
   const unique = deduplicateLeads(rows);
   const total  = unique.length;
 
+  // Bureau confidence
   const mediumHighConfidence = unique.filter(r =>
     r.PredictorConfidence &&
     ['MEDIUM', 'HIGH'].includes(String(r.PredictorConfidence).toUpperCase())
   ).length;
-  const confidencePct      = total > 0 ? (mediumHighConfidence / total) * 100 : 0;
-  const confidenceDimScore = scoreConfidence(confidencePct);
-  const confidenceGrade    = getGrade(confidenceDimScore);
+  const confidencePct   = total > 0 ? (mediumHighConfidence / total) * 100 : 0;
+  const confidenceScore = scoreConfidence(confidencePct);
 
-  const leadsWithCredit = unique.filter(r => r.CreditScore && Number(r.CreditScore) > 0);
-  const avgCreditScore  = Math.round(safeAvg(leadsWithCredit.map(r => Number(r.CreditScore))));
-  const creditDimScore  = scoreCreditScore(avgCreditScore);
-  const creditGrade     = getGrade(creditDimScore);
+  // Application completion (has SubmittedOn)
+  const completed       = unique.filter(r =>
+    r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL'
+  ).length;
+  const completionPct   = total > 0 ? (completed / total) * 100 : 0;
+  const completionScore = scoreApplicationCompletion(completionPct);
 
-  const dtiValues = unique.map(r => {
-    const income   = Number(r.NetIncome);
-    const expenses = Number(r.CalculatedTotalExpenses);
-    return (income > 0 && expenses > 0 && expenses / income < 2)
-      ? (expenses / income) * 100 : null;
-  }).filter(v => v !== null);
-  const avgDti       = dtiValues.length > 0 ? +safeAvg(dtiValues).toFixed(1) : 0;
-  const debtDimScore = scoreDebtLevel(avgDti);
-  const debtGrade    = getGrade(debtDimScore);
-
+  const weights = { confidence: 0.60, completion: 0.40 };
   const compositeScore = Math.round(
-    (confidenceDimScore * 0.20) +
-    (creditDimScore     * 0.40) +
-    (debtDimScore       * 0.40)
+    (confidenceScore * weights.confidence) +
+    (completionScore * weights.completion)
   );
-  const overallGrade = getGrade(compositeScore);
 
   return {
-    score:      compositeScore,
-    grade:      overallGrade,
-    totalLeads: total,
-    dimensions: {
-      predictorConfidence: {
-        score: confidenceDimScore, grade: confidenceGrade, weight: 0.20,
-        rawValue: +confidencePct.toFixed(1),
-        label:    `${confidencePct.toFixed(1)}% medium/high confidence`,
-        recommendation: RECOMMENDATIONS.predictorConfidence[confidenceGrade],
-      },
-      creditScore: {
-        score: creditDimScore, grade: creditGrade, weight: 0.40,
-        rawValue: avgCreditScore,
-        label:    avgCreditScore > 0 ? `Avg credit score ${avgCreditScore}` : 'Insufficient credit data',
-        recommendation: RECOMMENDATIONS.creditScore[creditGrade],
-      },
-      debtLevel: {
-        score: debtDimScore, grade: debtGrade, weight: 0.40,
-        rawValue: avgDti,
-        label:    avgDti > 0 ? `Avg DTI ${avgDti}%` : 'Insufficient debt data',
-        recommendation: RECOMMENDATIONS.debtLevel[debtGrade],
-      },
-    },
-    leadsWithCreditData: leadsWithCredit.length,
-    leadsWithDebtData:   dtiValues.length,
+    score:          compositeScore,
+    grade:          getGrade(compositeScore),
+    confidencePct:  +confidencePct.toFixed(1),
+    completionPct:  +completionPct.toFixed(1),
+    confidenceScore,
+    completionScore,
+    weights,
     mediumHighConfidence,
+    completedApplications: completed,
+    totalLeads: total,
     confidenceBreakdown: {
       high:          unique.filter(r => String(r.PredictorConfidence).toUpperCase() === 'HIGH').length,
       medium:        unique.filter(r => String(r.PredictorConfidence).toUpperCase() === 'MEDIUM').length,
       low:           unique.filter(r => String(r.PredictorConfidence).toUpperCase() === 'LOW').length,
       notApplicable: unique.filter(r => String(r.PredictorConfidence).toUpperCase() === 'NOTAPPLICABLE').length,
     },
+  };
+}
+
+// ─── Applicant quality ────────────────────────────────────────────────────────
+
+function calculateApplicantQuality(rows) {
+  const unique = deduplicateLeads(rows);
+
+  // Credit score
+  const leadsWithCredit = unique.filter(r => r.CreditScore && Number(r.CreditScore) > 0);
+  const avgCreditScore  = Math.round(safeAvg(leadsWithCredit.map(r => Number(r.CreditScore))));
+  const creditScore     = scoreCreditScore(avgCreditScore);
+
+  // DTI
+  const dtiValues = unique.map(r => {
+    const income   = Number(r.NetIncome);
+    const expenses = Number(r.CalculatedTotalExpenses);
+    return (income > 0 && expenses > 0 && expenses / income < 2)
+      ? (expenses / income) * 100 : null;
+  }).filter(v => v !== null);
+  const avgDti   = dtiValues.length > 0 ? +safeAvg(dtiValues).toFixed(1) : 0;
+  const dtiScore = scoreDebtLevel(avgDti);
+
+  // Income
+  const incomeValues = unique.map(r => Number(r.NetIncome)).filter(v => v > 0);
+  const avgIncome    = Math.round(safeAvg(incomeValues));
+  const incomeScore  = scoreIncomeProfile(avgIncome);
+
+  const weights = { credit: 0.45, debt: 0.35, income: 0.20 };
+  const compositeScore = Math.round(
+    (creditScore  * weights.credit) +
+    (dtiScore     * weights.debt)   +
+    (incomeScore  * weights.income)
+  );
+
+  return {
+    score:          compositeScore,
+    grade:          getGrade(compositeScore),
+    avgCreditScore,
+    avgDti,
+    avgIncome,
+    creditScore,
+    dtiScore,
+    incomeScore,
+    weights,
+    leadsWithCreditData: leadsWithCredit.length,
+    leadsWithDebtData:   dtiValues.length,
+  };
+}
+
+// ─── Overall lead quality intelligence ───────────────────────────────────────
+
+function calculateLeadQualityIntelligence(rows) {
+  const traffic   = calculateTrafficQuality(rows);
+  const applicant = calculateApplicantQuality(rows);
+
+  const overallWeights = { traffic: 0.40, applicant: 0.60 };
+  const overallScore   = Math.round(
+    (traffic.score   * overallWeights.traffic) +
+    (applicant.score * overallWeights.applicant)
+  );
+  const overallGrade = getGrade(overallScore);
+
+  const insights = generateInsights({
+    confidencePct:   traffic.confidencePct,
+    completionPct:   traffic.completionPct,
+    avgCreditScore:  applicant.avgCreditScore,
+    avgDti:          applicant.avgDti,
+    avgIncome:       applicant.avgIncome,
+    trafficScore:    traffic.score,
+    applicantScore:  applicant.score,
+    overallScore,
+    trafficWeights:  traffic.weights,
+    applicantWeights: applicant.weights,
+  });
+
+  // Biggest opportunity = highest-gain non-positive insight
+  const biggestOpportunity = insights.find(i => i.severity !== 'positive' && i.estimatedGain > 0) || null;
+
+  return {
+    score:              overallScore,
+    grade:              overallGrade,
+    totalLeads:         traffic.totalLeads,
+    trafficQuality:     traffic,
+    applicantQuality:   applicant,
+    overallWeights,
+    insights,
+    biggestOpportunity,
+  };
+}
+
+// ─── Legacy: kept for dataQuality field backward compatibility ────────────────
+
+function calculateLeadQuality(rows) {
+  const lqi = calculateLeadQualityIntelligence(rows);
+  return {
+    score:               lqi.score,
+    grade:               lqi.grade,
+    totalLeads:          lqi.totalLeads,
+    dimensions: {
+      predictorConfidence: {
+        score:          lqi.trafficQuality.confidenceScore,
+        grade:          getGrade(lqi.trafficQuality.confidenceScore),
+        weight:         0.20,
+        rawValue:       lqi.trafficQuality.confidencePct,
+        label:          `${lqi.trafficQuality.confidencePct}% medium/high confidence`,
+      },
+      creditScore: {
+        score:          lqi.applicantQuality.creditScore,
+        grade:          getGrade(lqi.applicantQuality.creditScore),
+        weight:         0.40,
+        rawValue:       lqi.applicantQuality.avgCreditScore,
+        label:          lqi.applicantQuality.avgCreditScore > 0
+                          ? `Avg credit score ${lqi.applicantQuality.avgCreditScore}`
+                          : 'Insufficient credit data',
+      },
+      debtLevel: {
+        score:          lqi.applicantQuality.dtiScore,
+        grade:          getGrade(lqi.applicantQuality.dtiScore),
+        weight:         0.40,
+        rawValue:       lqi.applicantQuality.avgDti,
+        label:          lqi.applicantQuality.avgDti > 0
+                          ? `Avg DTI ${lqi.applicantQuality.avgDti}%`
+                          : 'Insufficient debt data',
+      },
+    },
+    leadsWithCreditData:   lqi.applicantQuality.leadsWithCreditData,
+    leadsWithDebtData:     lqi.applicantQuality.leadsWithDebtData,
+    mediumHighConfidence:  lqi.trafficQuality.mediumHighConfidence,
+    confidenceBreakdown:   lqi.trafficQuality.confidenceBreakdown,
   };
 }
 
@@ -282,7 +596,8 @@ function calculateDealerBreakdown(rows) {
 export function processRows(rows, metadata = {}) {
   if (!rows || rows.length === 0) throw new Error('No data rows provided');
 
-  const lq = calculateLeadQuality(rows);
+  const lqi = calculateLeadQualityIntelligence(rows);
+  const lq  = calculateLeadQuality(rows); // backward compat
 
   return {
     meta: {
@@ -295,11 +610,12 @@ export function processRows(rows, metadata = {}) {
       dealerSlug:  metadata.dealerSlug || null,
       source:      metadata.source     || 'seriti-api',
     },
-    funnel:             calculateFunnel(rows),
-    incomeDistribution: calculateIncomeDistribution(rows),
-    incomeGroups:       calculateIncomeGroups(rows),
-    leadQuality:        lq,
-    dataQuality: {
+    funnel:                   calculateFunnel(rows),
+    incomeDistribution:       calculateIncomeDistribution(rows),
+    incomeGroups:             calculateIncomeGroups(rows),
+    leadQualityIntelligence:  lqi,   // ← new
+    leadQuality:              lq,    // ← kept for backward compat
+    dataQuality: {                   // ← kept for backward compat
       score:                lq.score,
       totalLeads:           lq.totalLeads,
       mediumHighConfidence: lq.mediumHighConfidence,
