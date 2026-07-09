@@ -71,9 +71,13 @@ async function sendMagicLinkEmail(env, { email, token, dealerName }) {
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px;">
       <div style="max-width: 480px; margin: 0 auto; background: white; border-radius: 24px; padding: 40px; border: 1px solid #e2e8f0;">
         <div style="text-align: center; margin-bottom: 32px;">
-          <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; background: #0f766e; border-radius: 16px; margin-bottom: 12px;">
-            <span style="color: white; font-size: 20px; font-weight: 900;">E</span>
-          </div>
+          <table role="presentation" style="margin: 0 auto 12px; border-collapse: collapse;">
+            <tr>
+              <td style="width: 48px; height: 48px; background: #0f766e; border-radius: 16px; text-align: center; vertical-align: middle;">
+                <span style="color: white; font-size: 20px; font-weight: 900; line-height: 48px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">E</span>
+              </td>
+            </tr>
+          </table>
           <p style="margin: 0; font-size: 13px; font-weight: 600; color: #475569; letter-spacing: 0.05em;">E-FFICIENT ANALYTICS</p>
         </div>
 
