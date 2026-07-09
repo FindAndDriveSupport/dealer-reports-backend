@@ -8,15 +8,6 @@
  *   JWT_SECRET — same secret used to sign tokens in auth.js
  */
 
-export interface DealerContext {
-  userId: string;
-  email: string;
-  dealerId: string;
-  dealerName: string;
-  financeType: 'vehicle' | 'bike';
-  isAdmin: boolean;
-}
-
 // ── JWT verification (Web Crypto) ─────────────────────────────────────────────
 
 function base64UrlDecode(str) {
@@ -57,26 +48,11 @@ function extractDealer(payload) {
   return {
     userId:      payload.sub,
     email:       payload.email,
-    dealerId:    payload.dealer_id || '',
+    dealerId:    payload.dealer_id  || '',
     dealerName:  payload.dealer_name || '',
     financeType: payload.finance_type || 'vehicle',
     isAdmin:     payload.is_admin === true,
   };
-}
-
-// ── CORS helpers ──────────────────────────────────────────────────────────────
-
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-  'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-};
-
-function corsResponse(body, status, extra = {}) {
-  return new Response(body, {
-    status,
-    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS, ...extra },
-  });
 }
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
@@ -84,16 +60,22 @@ function corsResponse(body, status, extra = {}) {
 export function withAuth(handler) {
   return async (request, env, ctx) => {
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204 });
     }
 
     const authHeader = request.headers.get('Authorization');
     if (!authHeader?.startsWith('Bearer ')) {
-      return corsResponse(JSON.stringify({ error: 'Missing Authorization header' }), 401);
+      return new Response(JSON.stringify({ error: 'Missing Authorization header' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     if (!env.JWT_SECRET) {
-      return corsResponse(JSON.stringify({ error: 'JWT_SECRET not configured' }), 500);
+      return new Response(JSON.stringify({ error: 'JWT_SECRET not configured' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     const token = authHeader.slice(7);
@@ -104,7 +86,10 @@ export function withAuth(handler) {
       return handler(request, env, ctx, dealer);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unauthorized';
-      return corsResponse(JSON.stringify({ error: message }), 401);
+      return new Response(JSON.stringify({ error: message }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
   };
 }
