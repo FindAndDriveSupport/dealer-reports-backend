@@ -1,32 +1,20 @@
 /**
  * index.js — Cloudflare Worker entry point
  *
- * Replaces Express. Routes requests manually to handler functions.
- * env is passed into every handler — no process.env anywhere.
- *
- * KV namespace bindings (set in wrangler.toml + Cloudflare dashboard):
- *   CACHE  — dealer report data + master index
- *   TOKENS — Seriti JWT token cache
- *
- * Secrets (set via `wrangler secret put` or dashboard):
- *   SERITI_API_BASE_URL
- *   SERITI_API_KEY_ID
- *   SERITI_API_SECRET
- *   WEBHOOK_SECRET
+ * Secrets (set via wrangler secret put):
+ *   SERITI_API_BASE_URL, SERITI_API_KEY_ID, SERITI_API_SECRET
  *   ALLOWED_ORIGINS
- *   MIXPANEL_SERVICE_ACCOUNT_USERNAME
- *   MIXPANEL_SERVICE_ACCOUNT_SECRET
- *   MIXPANEL_PROJECT_ID
- *   EMAIL_PROVIDER
- *   EMAIL_FROM
- *   EMAIL_FROM_NAME
- *   EMAIL_API_KEY
- *   SUPABASE_JWT_SECRET  ← Supabase dashboard > Settings > API > JWT Secret
+ *   MIXPANEL_SERVICE_ACCOUNT_USERNAME, MIXPANEL_SERVICE_ACCOUNT_SECRET, MIXPANEL_PROJECT_ID
+ *   EMAIL_PROVIDER, EMAIL_FROM, EMAIL_FROM_NAME, EMAIL_API_KEY
+ *   RESEND_API_KEY
+ *   JWT_SECRET   ← new: used to sign/verify all JWTs
  */
 
 import { handleReport }   from './report.js';
 import { handleMixpanel } from './mixpanel.js';
 import { handleEmail }    from './email.js';
+import { handleAdmin }    from './admin.js';
+import { handleAuth }     from './auth.js';
 import { withAuth }       from './middleware/auth.js';
 
 export default {
@@ -42,33 +30,55 @@ export default {
 
     const corsHeaders = {
       'Access-Control-Allow-Origin':  corsOk ? origin : allowed[0],
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-webhook-secret',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // ── Health (public — no auth required) ───────────────────────────────────
+    // ── Health (public) ───────────────────────────────────────────────────────
     if (path === '/health' && method === 'GET') {
       return json({
         status:    'ok',
         platform:  'Seriti E-fficient API',
-        version:   '2.0.0',
+        version:   '3.0.0',
         runtime:   'Cloudflare Workers',
         timestamp: new Date().toISOString(),
       }, 200, corsHeaders);
     }
 
-    // ── Route dispatch ────────────────────────────────────────────────────────
+    // ── Auth routes (public — no JWT required) ────────────────────────────────
+    if (path.startsWith('/api/auth')) {
+      const response = await handleAuth(request, env, path, method);
+      const headers  = new Headers(response.headers);
+      Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
+      return new Response(response.body, { status: response.status, headers });
+    }
+
+    // ── Refresh (admin JWT required) ──────────────────────────────────────────
+    if (path === '/api/report/refresh' && method === 'POST') {
+      const response = await withAuth(async (req, e, c, dealer) => {
+        if (!dealer.isAdmin) return json({ error: 'Forbidden — admin access only' }, 403);
+        return handleReport(req, e, path, method, dealer);
+      })(request, env, ctx);
+
+      const headers = new Headers(response.headers);
+      Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
+      return new Response(response.body, { status: response.status, headers });
+    }
+
+    // ── Protected routes ──────────────────────────────────────────────────────
     try {
       let response;
 
-      if (path.startsWith('/api/report')) {
-        // Protected — dealer JWT required. withAuth verifies the token and
-        // injects a `dealer` object (dealerId, dealerName, financeType) as
-        // the fourth argument to the inner handler.
+      if (path.startsWith('/api/admin')) {
+        response = await withAuth(
+          (req, e, c, dealer) => handleAdmin(req, e, path, method, dealer)
+        )(request, env, ctx);
+
+      } else if (path.startsWith('/api/report')) {
         response = await withAuth(
           (req, e, c, dealer) => handleReport(req, e, path, method, dealer)
         )(request, env, ctx);
@@ -85,7 +95,6 @@ export default {
         response = json({ error: 'Not found' }, 404);
       }
 
-      // Attach CORS headers to every response
       const headers = new Headers(response.headers);
       Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
       return new Response(response.body, { status: response.status, headers });
@@ -101,13 +110,9 @@ export default {
   },
 };
 
-// ── Shared helper — used by all route handlers ────────────────────────────────
 export function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      'Content-Type': 'application/json',
-      ...extraHeaders,
-    },
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
   });
 }
