@@ -1,13 +1,13 @@
 /**
  * index.js — Cloudflare Worker entry point
  *
- * Secrets (set via wrangler secret put):
+ * Secrets:
  *   SERITI_API_BASE_URL, SERITI_API_KEY_ID, SERITI_API_SECRET
  *   ALLOWED_ORIGINS
  *   MIXPANEL_SERVICE_ACCOUNT_USERNAME, MIXPANEL_SERVICE_ACCOUNT_SECRET, MIXPANEL_PROJECT_ID
  *   EMAIL_PROVIDER, EMAIL_FROM, EMAIL_FROM_NAME, EMAIL_API_KEY
  *   RESEND_API_KEY
- *   JWT_SECRET   ← new: used to sign/verify all JWTs
+ *   JWT_SECRET
  */
 
 import { handleReport }   from './report.js';
@@ -15,6 +15,7 @@ import { handleMixpanel } from './mixpanel.js';
 import { handleEmail }    from './email.js';
 import { handleAdmin }    from './admin.js';
 import { handleAuth }     from './auth.js';
+import { handleDealers }  from './dealers.js';
 import { withAuth }       from './middleware/auth.js';
 
 export default {
@@ -23,7 +24,6 @@ export default {
     const path   = url.pathname;
     const method = request.method;
 
-    // ── CORS ──────────────────────────────────────────────────────────────────
     const origin  = request.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGINS || '*').split(',').map(o => o.trim());
     const corsOk  = allowed.includes('*') || allowed.includes(origin);
@@ -38,18 +38,16 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // ── Health (public) ───────────────────────────────────────────────────────
     if (path === '/health' && method === 'GET') {
       return json({
         status:    'ok',
         platform:  'Seriti E-fficient API',
-        version:   '3.0.0',
+        version:   '4.0.0',
         runtime:   'Cloudflare Workers',
         timestamp: new Date().toISOString(),
       }, 200, corsHeaders);
     }
 
-    // ── Auth routes (public — no JWT required) ────────────────────────────────
     if (path.startsWith('/api/auth')) {
       const response = await handleAuth(request, env, path, method);
       const headers  = new Headers(response.headers);
@@ -57,7 +55,6 @@ export default {
       return new Response(response.body, { status: response.status, headers });
     }
 
-    // ── Refresh (admin JWT required) ──────────────────────────────────────────
     if (path === '/api/report/refresh' && method === 'POST') {
       const response = await withAuth(async (req, e, c, dealer) => {
         if (!dealer.isAdmin) return json({ error: 'Forbidden — admin access only' }, 403);
@@ -69,13 +66,17 @@ export default {
       return new Response(response.body, { status: response.status, headers });
     }
 
-    // ── Protected routes ──────────────────────────────────────────────────────
     try {
       let response;
 
       if (path.startsWith('/api/admin')) {
         response = await withAuth(
           (req, e, c, dealer) => handleAdmin(req, e, path, method, dealer)
+        )(request, env, ctx);
+
+      } else if (path.startsWith('/api/dealers')) {
+        response = await withAuth(
+          (req, e, c, dealer) => handleDealers(req, e, path, method, dealer)
         )(request, env, ctx);
 
       } else if (path.startsWith('/api/report')) {
