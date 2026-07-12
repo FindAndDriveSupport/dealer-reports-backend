@@ -158,9 +158,13 @@ function processEvents(events) {
 
   const distinctIds    = base.map(e => e.properties?.distinct_id).filter(Boolean);
   const uniqueVisitors = new Set(distinctIds).size;
-  const returning      = distinctIds.length - uniqueVisitors;
+  const totalVisits    = distinctIds.length;
+  const repeatVisits   = totalVisits - uniqueVisitors;
   const returnRate     = uniqueVisitors > 0
-    ? +((returning / distinctIds.length) * 100).toFixed(1)
+    ? +((repeatVisits / totalVisits) * 100).toFixed(1)
+    : 0;
+  const avgVisitsPerVisitor = uniqueVisitors > 0
+    ? +(totalVisits / uniqueVisitors).toFixed(2)
     : 0;
 
   const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -204,6 +208,9 @@ function processEvents(events) {
     devices,
     provinces,
     returnRate,
+    uniqueVisitors,
+    totalVisits,
+    avgVisitsPerVisitor,
     heatmap,
     peakHours,
     totalEvents: events.length,
