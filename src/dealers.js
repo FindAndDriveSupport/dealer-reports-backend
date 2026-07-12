@@ -35,8 +35,11 @@ async function canAccessDealer(env, dealer, targetDealerId) {
 
 async function queryPolicySummary(env, dealerKey, startDate, endDate) {
   const hasDateRange = !!(startDate && endDate);
+  // created_at is stored with a 'T' separator (e.g. 2026-06-18T05:22:12.48).
+  // Using a space separator here breaks lexicographic comparison on the end
+  // boundary date, silently excluding same-day records. Match the format.
   const dateClause = hasDateRange ? `AND created_at >= ? AND created_at <= ?` : '';
-  const dateParams = hasDateRange ? [startDate, `${endDate} 23:59:59`] : [];
+  const dateParams = hasDateRange ? [`${startDate}T00:00:00`, `${endDate}T23:59:59.999`] : [];
 
   const totalsResult = await env.DB.prepare(`
     SELECT
@@ -69,6 +72,7 @@ async function queryPolicySummary(env, dealerKey, startDate, endDate) {
   `).bind(dealerKey, ...dateParams).all();
 
   const fcDateClause = hasDateRange ? `AND created_at >= ? AND created_at <= ?` : '';
+  const fcParams = hasDateRange ? [`${startDate}T00:00:00`, `${endDate}T23:59:59.999`] : [];
   const financeCompanyResult = await env.DB.prepare(`
     SELECT finance_company, COUNT(*) as count,
       COUNT(CASE WHEN finance_status = 'PAID OUT' THEN 1 END) as paid_out
@@ -76,7 +80,7 @@ async function queryPolicySummary(env, dealerKey, startDate, endDate) {
     WHERE dealer_key = ? AND finance_company IS NOT NULL ${fcDateClause}
     GROUP BY finance_company
     ORDER BY count DESC
-  `).bind(dealerKey, ...dateParams).all();
+  `).bind(dealerKey, ...fcParams).all();
 
   return {
     totals:            totalsResult.results        || [],
