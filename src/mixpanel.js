@@ -14,15 +14,6 @@ import { json } from './index.js';
 const EXPORT_URL = 'https://data-eu.mixpanel.com/api/2.0/export';
 const CACHE_TTL  = 60 * 60; // 1 hour
 
-// ─── Branch code → dealer slug mapping ───────────────────────────────────────
-const BRANCH_TO_SLUG = {
-  'YCGY001':  'yourcarguy',
-  'YONDA001': 'yonda',
-  'FAD001':   'findanddrive',
-  'GFI001':   'gfi-motor-corporation-pty-ltd-new',
-  'NWF001':   'north-western-ford',
-};
-
 // ─── Fetch raw events from Mixpanel Export API ────────────────────────────────
 
 async function fetchRawEvents(env, { startDate, endDate }) {
@@ -73,17 +64,16 @@ async function fetchRawEvents(env, { startDate, endDate }) {
   return events;
 }
 
-// ─── Filter events by dealer slug ─────────────────────────────────────────────
+// ─── Filter events by Seriti branch code ─────────────────────────────────────
+// Branch code comes from D1 dealers.branch_code (set during onboarding),
+// no more hardcoded slug maps to keep in sync manually.
 
-function filterByDealer(events, dealerSlug) {
-  if (!dealerSlug || dealerSlug === 'all') return events;
+function filterByBranchCode(events, branchCode) {
+  if (!branchCode) return events;
 
   return events.filter(e => {
     const url = e.properties?.current_url_search || e.properties?.['$current_url'] || '';
-    const branchMatch = Object.entries(BRANCH_TO_SLUG).some(
-      ([code, slug]) => slug === dealerSlug && url.includes(code)
-    );
-    return branchMatch;
+    return url.includes(branchCode);
   });
 }
 
@@ -254,8 +244,17 @@ export async function getEngagementForDealer(env, dealerId, startDate, endDate) 
     if (cached) return { ...JSON.parse(cached), _cached: true };
   } catch { /* cache miss */ }
 
+  // Look up the Seriti branch code for this dealer from D1 — set during onboarding.
+  let branchCode = null;
+  if (env.DB) {
+    const row = await env.DB.prepare(
+      `SELECT branch_code FROM dealers WHERE id = ?`
+    ).bind(dealerId).first();
+    branchCode = row?.branch_code || null;
+  }
+
   const allEvents  = await fetchRawEvents(env, dates);
-  const filtered   = filterByDealer(allEvents, dealerId);
+  const filtered   = filterByBranchCode(allEvents, branchCode);
   const engagement = processEvents(filtered);
 
   await env.CACHE.put(cacheKey, JSON.stringify(engagement), { expirationTtl: CACHE_TTL });
@@ -280,8 +279,13 @@ export async function handleMixpanel(request, env, path, method, dealer) {
 
   if (subPath === '/raw') {
     try {
-      const events   = await fetchRawEvents(env, dates);
-      const filtered = filterByDealer(events, dealer.dealerId);
+      const events = await fetchRawEvents(env, dates);
+      let branchCode = null;
+      if (env.DB) {
+        const row = await env.DB.prepare(`SELECT branch_code FROM dealers WHERE id = ?`).bind(dealer.dealerId).first();
+        branchCode = row?.branch_code || null;
+      }
+      const filtered = filterByBranchCode(events, branchCode);
       return json({
         totalEvents: filtered.length,
         eventTypes:  [...new Set(filtered.map(e => e.event))].slice(0, 20),
