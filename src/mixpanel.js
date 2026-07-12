@@ -1,9 +1,15 @@
 /**
- * mixpanel.js — Cloudflare Worker edition
+ * mixpanel.js — Cloudflare Worker edition (JQL-based)
+ *
+ * Uses Mixpanel's JQL API to filter events server-side (by branch code and
+ * date range) before any data is transferred — instead of downloading the
+ * full account export and filtering client-side, which was expensive even
+ * for narrow queries (e.g. "one dealer, last 7 days" still cost the same as
+ * "everyone, last 7 days") and could exceed Worker CPU/memory limits on
+ * larger exports (Cloudflare error 1102).
  *
  * Exports getEngagementForDealer() for use by dealers.js's access-scoped
- * /api/dealers/:id/engagement route — the D1-based dealer model, fully
- * independent of Seriti's report index.
+ * /api/dealers/:id/engagement route.
  *
  * Env vars:
  *   MIXPANEL_API_SECRET
@@ -11,86 +17,97 @@
 
 import { json } from './index.js';
 
-const EXPORT_URL = 'https://data-eu.mixpanel.com/api/2.0/export';
-const CACHE_TTL  = 60 * 60; // 1 hour
+const JQL_URL = 'https://data-eu.mixpanel.com/api/2.0/jql';
+const CACHE_TTL = 60 * 60; // 1 hour
+const MAX_EVENTS = 50000;  // safety cap on returned rows
 
-// ─── Fetch raw events from Mixpanel Export API ────────────────────────────────
+// ─── JQL query ────────────────────────────────────────────────────────────────
+// Filters to page-view events matching the branch code, and maps each event
+// down to only the fields the dashboard needs — everything else (raw
+// payloads, unrelated properties) never leaves Mixpanel's servers.
 
-async function fetchRawEvents(env, { startDate, endDate }) {
+function buildScript(fromDate, toDate, branchCode) {
+  // branchCode is sourced from our own D1 table (admin-controlled, not raw
+  // user input), but still escaped defensively before interpolating into
+  // the JQL script string.
+  const safeBranch = String(branchCode || '').replace(/["\\]/g, '');
+
+  return `
+function main() {
+  return Events({
+    from_date: "${fromDate}",
+    to_date: "${toDate}",
+    event_selectors: [{event: "$mp_web_page_view"}, {event: "page_view"}]
+  })
+  .filter(function(e) {
+    var url = (e.properties["current_url_search"] || e.properties["$current_url"] || "");
+    return ${safeBranch ? `url.indexOf("${safeBranch}") !== -1` : 'true'};
+  })
+  .map(function(e) {
+    return {
+      referrer:    e.properties["$initial_referrer"] || "",
+      device:      e.properties["$device"] || "",
+      os:          e.properties["$os"] || "",
+      userAgent:   e.properties["$user_agent"] || "",
+      region:      e.properties["$region"] || "",
+      distinctId:  e.properties["distinct_id"] || "",
+      time:        e.time
+    };
+  });
+}
+`.trim();
+}
+
+async function fetchEngagementEvents(env, { startDate, endDate }, branchCode) {
   const secret = env.MIXPANEL_API_SECRET;
   if (!secret) throw new Error('MIXPANEL_API_SECRET is not set');
 
-  const params      = new URLSearchParams({ from_date: startDate, to_date: endDate });
-  const url         = `${EXPORT_URL}?${params}`;
+  const script      = buildScript(startDate, endDate, branchCode);
   const credentials = btoa(`${secret}:`);
 
-  const res = await fetch(url, {
+  const body = new URLSearchParams({ script });
+
+  const res = await fetch(JQL_URL, {
+    method: 'POST',
     headers: {
-      Authorization:     `Basic ${credentials}`,
-      'Accept-Encoding': 'gzip',
+      Authorization:  `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
+    body,
   });
 
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Mixpanel export failed (${res.status}): ${body}`);
+    const text = await res.text();
+    throw new Error(`Mixpanel JQL failed (${res.status}): ${text}`);
   }
 
-  const events  = [];
-  const reader  = res.body.getReader();
-  const decoder = new TextDecoder();
-  let   buffer  = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop();
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try { events.push(JSON.parse(trimmed)); } catch { /* skip */ }
-    }
+  const rows = await res.json();
+  if (!Array.isArray(rows)) {
+    throw new Error('Unexpected JQL response shape');
   }
 
-  if (buffer.trim()) {
-    try { events.push(JSON.parse(buffer.trim())); } catch { /* skip */ }
+  const truncated = rows.length > MAX_EVENTS;
+  const events    = truncated ? rows.slice(0, MAX_EVENTS) : rows;
+
+  if (truncated) {
+    console.warn(`[mixpanel] JQL returned ${rows.length} rows, capped at ${MAX_EVENTS} — narrow the date range for exact figures.`);
   }
 
-  console.log(`[mixpanel] Fetched ${events.length} raw events`);
+  console.log(`[mixpanel] JQL returned ${events.length} matching events${branchCode ? ` (branch=${branchCode})` : ' (unfiltered)'}`);
   return events;
 }
 
-// ─── Filter events by Seriti branch code ─────────────────────────────────────
-// Branch code comes from D1 dealers.branch_code (set during onboarding),
-// no more hardcoded slug maps to keep in sync manually.
+// ─── Process flat JQL rows → EngagementData ───────────────────────────────────
+// Rows are already filtered and reshaped by JQL, so this is pure aggregation
+// over a small, relevant dataset — no per-event classification of raw
+// Mixpanel payloads needed here anymore.
 
-function filterByBranchCode(events, branchCode) {
-  if (!branchCode) return events;
-
-  return events.filter(e => {
-    const url = e.properties?.current_url_search || e.properties?.['$current_url'] || '';
-    return url.includes(branchCode);
-  });
-}
-
-// ─── Process raw events → EngagementData ─────────────────────────────────────
-
-function processEvents(events) {
-  const pageViews = events.filter(e =>
-    e.event === '$mp_web_page_view' || e.event === 'page_view'
-  );
-
-  const total = pageViews.length || events.length;
-  const base  = pageViews.length ? pageViews : events;
+function processEvents(rows) {
+  const total = rows.length;
 
   const channelMap = {};
-  base.forEach(e => {
-    const referrer = e.properties?.['$initial_referrer'] || 'direct';
-    const channel  = classifyReferrer(referrer);
+  rows.forEach(r => {
+    const channel = classifyReferrer(r.referrer);
     channelMap[channel] = (channelMap[channel] || 0) + 1;
   });
   const acquisitionChannels = Object.entries(channelMap)
@@ -102,13 +119,8 @@ function processEvents(events) {
     .sort((a, b) => b.count - a.count);
 
   const deviceMap = { mobile: 0, desktop: 0, tablet: 0 };
-  base.forEach(e => {
-    const device = classifyDevice(
-      e.properties?.['$device'] || '',
-      e.properties?.['$os']     || '',
-      e.properties?.['$user_agent'] || ''
-    );
-    deviceMap[device]++;
+  rows.forEach(r => {
+    deviceMap[classifyDevice(r.device, r.os, r.userAgent)]++;
   });
   const deviceTotal = Object.values(deviceMap).reduce((a, b) => a + b, 0);
   const devices = Object.entries(deviceMap).map(([type, count]) => ({
@@ -118,8 +130,8 @@ function processEvents(events) {
   }));
 
   const provinceMap = {};
-  base.forEach(e => {
-    const province = e.properties?.['$region'] || 'Unknown';
+  rows.forEach(r => {
+    const province = r.region || 'Unknown';
     provinceMap[province] = (provinceMap[province] || 0) + 1;
   });
   const provinces = Object.entries(provinceMap)
@@ -131,7 +143,7 @@ function processEvents(events) {
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
 
-  const distinctIds    = base.map(e => e.properties?.distinct_id).filter(Boolean);
+  const distinctIds    = rows.map(r => r.distinctId).filter(Boolean);
   const uniqueVisitors = new Set(distinctIds).size;
   const returning      = distinctIds.length - uniqueVisitors;
   const returnRate     = uniqueVisitors > 0
@@ -142,10 +154,9 @@ function processEvents(events) {
   const heatmapMap = {};
   DAYS.forEach(d => { heatmapMap[d] = {}; });
 
-  base.forEach(e => {
-    const ts = e.properties?.time;
-    if (!ts) return;
-    const date = new Date(ts * 1000);
+  rows.forEach(r => {
+    if (!r.time) return;
+    const date = new Date(r.time * 1000);
     const day  = DAYS[date.getUTCDay()];
     const hour = date.getUTCHours();
     heatmapMap[day][hour] = (heatmapMap[day][hour] || 0) + 1;
@@ -181,7 +192,7 @@ function processEvents(events) {
     returnRate,
     heatmap,
     peakHours,
-    totalEvents: events.length,
+    totalEvents: total,
   };
 }
 
@@ -253,9 +264,9 @@ export async function getEngagementForDealer(env, dealerId, startDate, endDate) 
     branchCode = row?.branch_code || null;
   }
 
-  const allEvents  = await fetchRawEvents(env, dates);
-  const filtered   = filterByBranchCode(allEvents, branchCode);
-  const engagement = processEvents(filtered);
+  // JQL filters server-side — only matching, reshaped rows are transferred.
+  const rows       = await fetchEngagementEvents(env, dates, branchCode);
+  const engagement = processEvents(rows);
 
   await env.CACHE.put(cacheKey, JSON.stringify(engagement), { expirationTtl: CACHE_TTL });
 
@@ -279,17 +290,15 @@ export async function handleMixpanel(request, env, path, method, dealer) {
 
   if (subPath === '/raw') {
     try {
-      const events = await fetchRawEvents(env, dates);
       let branchCode = null;
       if (env.DB) {
         const row = await env.DB.prepare(`SELECT branch_code FROM dealers WHERE id = ?`).bind(dealer.dealerId).first();
         branchCode = row?.branch_code || null;
       }
-      const filtered = filterByBranchCode(events, branchCode);
+      const rows = await fetchEngagementEvents(env, dates, branchCode);
       return json({
-        totalEvents: filtered.length,
-        eventTypes:  [...new Set(filtered.map(e => e.event))].slice(0, 20),
-        sample:      filtered.slice(0, 2),
+        totalEvents: rows.length,
+        sample:      rows.slice(0, 5),
       });
     } catch (err) {
       return json({ error: err.message }, 502);
