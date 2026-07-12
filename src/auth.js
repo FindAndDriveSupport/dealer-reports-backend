@@ -4,11 +4,10 @@
  * Routes:
  *   POST /api/auth/magic-link   — send magic link to email
  *   POST /api/auth/verify       — verify token, return JWT
- *   GET  /api/auth/me           — return current user from JWT
  *
  * Env vars required:
  *   RESEND_API_KEY
- *   JWT_SECRET          — secret for signing JWTs (set via wrangler secret put JWT_SECRET)
+ *   JWT_SECRET
  *
  * D1 binding required:
  *   DB — postal-codes-db
@@ -30,11 +29,7 @@ function generateToken(length = 32) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function generateId() {
-  return crypto.randomUUID();
-}
-
-// ── JWT helpers (Web Crypto — no npm deps) ────────────────────────────────────
+// ── JWT helpers ────────────────────────────────────────────────────────────────
 
 async function signJwt(payload, secret) {
   const header  = { alg: 'HS256', typ: 'JWT' };
@@ -52,8 +47,8 @@ async function signJwt(payload, secret) {
     ['sign']
   );
 
-  const sig     = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  const sigB64  = btoa(String.fromCharCode(...new Uint8Array(sig)))
+  const sig    = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
     .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 
   return `${data}.${sigB64}`;
@@ -126,7 +121,7 @@ async function sendMagicLinkEmail(env, { email, token, dealerName }) {
 export async function handleAuth(request, env, path, method) {
   const subPath = path.replace('/api/auth', '') || '/';
 
-  // POST /api/auth/magic-link — send magic link
+  // POST /api/auth/magic-link
   if (subPath === '/magic-link' && method === 'POST') {
     let body = {};
     try { body = await request.json(); } catch {}
@@ -138,30 +133,23 @@ export async function handleAuth(request, env, path, method) {
 
     if (!env.DB) return json({ error: 'Database not configured' }, 500);
 
-    // Look up user
     const user = await env.DB.prepare(
       `SELECT id, email, dealer_name, status FROM users WHERE email = ?`
     ).bind(email).first();
 
     if (!user) {
-      // Return success anyway to avoid email enumeration
       return json({ success: true, message: 'If this email is registered, a sign-in link has been sent.' });
     }
 
-    // Generate token
-    const token      = generateToken();
-    const expiresAt  = new Date(Date.now() + MAGIC_LINK_EXPIRY_MINUTES * 60 * 1000).toISOString();
+    const token     = generateToken();
+    const expiresAt = new Date(Date.now() + MAGIC_LINK_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
     await env.DB.prepare(
       `UPDATE users SET invite_token = ?, invite_expires_at = ? WHERE id = ?`
     ).bind(token, expiresAt, user.id).run();
 
     try {
-      await sendMagicLinkEmail(env, {
-        email,
-        token,
-        dealerName: user.dealer_name,
-      });
+      await sendMagicLinkEmail(env, { email, token, dealerName: user.dealer_name });
     } catch (err) {
       console.error('[auth] email error:', err.message);
       return json({ error: 'Failed to send sign-in email. Please try again.' }, 502);
@@ -181,7 +169,6 @@ export async function handleAuth(request, env, path, method) {
     if (!env.DB) return json({ error: 'Database not configured' }, 500);
     if (!env.JWT_SECRET) return json({ error: 'JWT secret not configured' }, 500);
 
-    // Look up token
     const user = await env.DB.prepare(
       `SELECT * FROM users WHERE invite_token = ?`
     ).bind(token).first();
@@ -190,17 +177,15 @@ export async function handleAuth(request, env, path, method) {
       return json({ error: 'Invalid or expired sign-in link.' }, 401);
     }
 
-    // Check expiry
     if (new Date(user.invite_expires_at) < new Date()) {
       return json({ error: 'This sign-in link has expired. Please request a new one.' }, 401);
     }
 
-    // Clear token + update last sign in
     await env.DB.prepare(
       `UPDATE users SET invite_token = NULL, invite_expires_at = NULL, last_sign_in_at = datetime('now'), status = 'active' WHERE id = ?`
     ).bind(user.id).run();
 
-    // Issue JWT
+    // Issue JWT — now includes group_id and role for access resolution
     const jwt = await signJwt({
       sub:          user.id,
       email:        user.email,
@@ -208,6 +193,8 @@ export async function handleAuth(request, env, path, method) {
       dealer_name:  user.dealer_name,
       finance_type: user.finance_type,
       is_admin:     user.is_admin === 1,
+      group_id:     user.group_id || null,
+      role:         user.role || 'user',
     }, env.JWT_SECRET);
 
     return json({
@@ -220,6 +207,8 @@ export async function handleAuth(request, env, path, method) {
         dealerName:  user.dealer_name,
         financeType: user.finance_type,
         isAdmin:     user.is_admin === 1,
+        groupId:     user.group_id || null,
+        role:        user.role || 'user',
       },
     });
   }
