@@ -23,7 +23,7 @@ const CACHE_TTL  = 60 * 60; // 1 hour
 
 const MAX_EVENTS = 50000; // safety cap on MATCHING events, not raw export size
 
-async function fetchRawEvents(env, { startDate, endDate }, branchCode = null) {
+async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
   const secret = env.MIXPANEL_API_SECRET;
   if (!secret) throw new Error('MIXPANEL_API_SECRET is not set');
 
@@ -50,10 +50,16 @@ async function fetchRawEvents(env, { startDate, endDate }, branchCode = null) {
   let   truncated  = false;
   let   totalSeen  = 0;
 
+  // Tracked URLs reflect the dealer's own website domain (or the
+  // seritifinance.findndrive.co.za subdomain) — Seriti branch codes never
+  // appear in the widget's tracked page URLs, they're internal to
+  // Seriti/Edith only. domainList is comma-separated; match any.
+  const domains = (domainList || '').split(',').map(d => d.trim()).filter(Boolean);
+
   const matches = (parsed) => {
-    if (!branchCode) return true;
+    if (domains.length === 0) return true;
     const url = parsed.properties?.current_url_search || parsed.properties?.['$current_url'] || '';
-    return url.includes(branchCode);
+    return domains.some(d => url.includes(d));
   };
 
   const tryPush = (line) => {
@@ -92,21 +98,8 @@ async function fetchRawEvents(env, { startDate, endDate }, branchCode = null) {
     console.warn(`[mixpanel] Matching-event cap reached (${MAX_EVENTS}) — narrow the date range for exact figures.`);
   }
 
-  console.log(`[mixpanel] Scanned ${totalSeen} events, kept ${events.length} matching${branchCode ? ` branch=${branchCode}` : ' (unfiltered)'}${truncated ? ' (capped)' : ''}`);
+  console.log(`[mixpanel] Scanned ${totalSeen} events, kept ${events.length} matching${domains.length ? ` domains=${domains.join('|')}` : ' (unfiltered)'}${truncated ? ' (capped)' : ''}`);
   return events;
-}
-
-// ─── Filter events by Seriti branch code ─────────────────────────────────────
-// Branch code comes from D1 dealers.branch_code (set during onboarding),
-// no more hardcoded slug maps to keep in sync manually.
-
-function filterByBranchCode(events, branchCode) {
-  if (!branchCode) return events;
-
-  return events.filter(e => {
-    const url = e.properties?.current_url_search || e.properties?.['$current_url'] || '';
-    return url.includes(branchCode);
-  });
 }
 
 // ─── Process raw events → EngagementData ─────────────────────────────────────
@@ -276,18 +269,19 @@ export async function getEngagementForDealer(env, dealerId, startDate, endDate) 
     if (cached) return { ...JSON.parse(cached), _cached: true };
   } catch { /* cache miss */ }
 
-  // Look up the Seriti branch code for this dealer from D1 — set during onboarding.
-  let branchCode = null;
+  // Look up the dealer's website domain(s) from D1 — set during onboarding.
+  // Tracked URLs reflect the domain, not a Seriti branch code.
+  let domainList = null;
   if (env.DB) {
     const row = await env.DB.prepare(
-      `SELECT branch_code FROM dealers WHERE id = ?`
+      `SELECT domain FROM dealers WHERE id = ?`
     ).bind(dealerId).first();
-    branchCode = row?.branch_code || null;
+    domainList = row?.domain || null;
   }
 
   // Filtered inline during streaming — keeps memory flat regardless of
   // total export size, avoiding Worker resource limit crashes.
-  const filtered   = await fetchRawEvents(env, dates, branchCode);
+  const filtered   = await fetchRawEvents(env, dates, domainList);
   const engagement = processEvents(filtered);
 
   await env.CACHE.put(cacheKey, JSON.stringify(engagement), { expirationTtl: CACHE_TTL });
@@ -312,12 +306,12 @@ export async function handleMixpanel(request, env, path, method, dealer) {
 
   if (subPath === '/raw') {
     try {
-      let branchCode = null;
+      let domainList = null;
       if (env.DB) {
-        const row = await env.DB.prepare(`SELECT branch_code FROM dealers WHERE id = ?`).bind(dealer.dealerId).first();
-        branchCode = row?.branch_code || null;
+        const row = await env.DB.prepare(`SELECT domain FROM dealers WHERE id = ?`).bind(dealer.dealerId).first();
+        domainList = row?.domain || null;
       }
-      const filtered = await fetchRawEvents(env, dates, branchCode);
+      const filtered = await fetchRawEvents(env, dates, domainList);
       return json({
         totalEvents: filtered.length,
         eventTypes:  [...new Set(filtered.map(e => e.event))].slice(0, 20),
