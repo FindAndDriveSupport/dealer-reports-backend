@@ -59,15 +59,24 @@ function main() {
 }
 
 async function fetchEngagementEvents(env, { startDate, endDate }, branchCode) {
-  const secret = env.MIXPANEL_API_SECRET;
-  if (!secret) throw new Error('MIXPANEL_API_SECRET is not set');
+  const username  = env.MIXPANEL_SERVICE_ACCOUNT_USERNAME;
+  const secret    = env.MIXPANEL_SERVICE_ACCOUNT_SECRET;
+  const projectId = env.MIXPANEL_PROJECT_ID;
+
+  if (!username || !secret) {
+    throw new Error('MIXPANEL_SERVICE_ACCOUNT_USERNAME / MIXPANEL_SERVICE_ACCOUNT_SECRET are not set — JQL requires a Service Account, not the legacy API secret');
+  }
+  if (!projectId) {
+    throw new Error('MIXPANEL_PROJECT_ID is not set — required alongside the Service Account to identify which project to query');
+  }
 
   const script      = buildScript(startDate, endDate, branchCode);
-  const credentials = btoa(`${secret}:`);
+  const credentials = btoa(`${username}:${secret}`);
 
+  const url  = `${JQL_URL}?project_id=${encodeURIComponent(projectId)}`;
   const body = new URLSearchParams({ script });
 
-  const res = await fetch(JQL_URL, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       Authorization:  `Basic ${credentials}`,
