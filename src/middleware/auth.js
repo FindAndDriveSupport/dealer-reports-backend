@@ -1,14 +1,9 @@
 /**
  * middleware/auth.js — JWT verification middleware
  *
- * Verifies JWTs signed by our own worker (auth.js signJwt).
- * No longer depends on Supabase.
- *
  * Env vars required:
- *   JWT_SECRET — same secret used to sign tokens in auth.js
+ *   JWT_SECRET
  */
-
-// ── JWT verification (Web Crypto) ─────────────────────────────────────────────
 
 function base64UrlDecode(str) {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
@@ -52,6 +47,8 @@ function extractDealer(payload) {
     dealerName:  payload.dealer_name || '',
     financeType: payload.finance_type || 'vehicle',
     isAdmin:     payload.is_admin === true,
+    groupId:     payload.group_id || null,
+    role:        payload.role || 'user',
   };
 }
 
