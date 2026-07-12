@@ -3,16 +3,11 @@
  *
  * All routes require a valid JWT from an admin user (is_admin = 1 in D1).
  *
- * D1 binding required: DB (postal-codes-db)
- *
  * Routes:
- *   GET  /api/admin/dealers            — list all dealer users
- *   POST /api/admin/invite             — invite a new dealer (creates D1 user + sends magic link)
+ *   GET  /api/admin/overview           — internal team + grouped dealer list
+ *   POST /api/admin/invite             — invite a new dealer or internal user
  *   PUT  /api/admin/dealers/:id        — update dealer metadata
  *   DELETE /api/admin/dealers/:id      — remove dealer access
- *   GET  /api/admin/stats              — usage stats per dealer (from KV cache)
- *   GET  /api/admin/policies           — policy_events summary (all dealers)
- *   GET  /api/admin/policies/:dealer   — policy_events summary (one dealer)
  */
 
 import { json } from './index.js';
@@ -34,9 +29,9 @@ function generateId() {
   return crypto.randomUUID();
 }
 
-async function sendInviteEmail(env, { email, token, dealerName }) {
+async function sendInviteEmail(env, { email, token, name }) {
   const link = `${SITE_URL}/auth/verify?token=${token}`;
-  const name = dealerName || 'there';
+  const greeting = name || 'there';
 
   const html = `
     <!DOCTYPE html>
@@ -44,16 +39,20 @@ async function sendInviteEmail(env, { email, token, dealerName }) {
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px;">
       <div style="max-width: 480px; margin: 0 auto; background: white; border-radius: 24px; padding: 40px; border: 1px solid #e2e8f0;">
         <div style="text-align: center; margin-bottom: 32px;">
-          <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; background: #0f766e; border-radius: 16px; margin-bottom: 12px;">
-            <span style="color: white; font-size: 20px; font-weight: 900;">E</span>
-          </div>
+          <table role="presentation" style="margin: 0 auto 12px; border-collapse: collapse;">
+            <tr>
+              <td style="width: 48px; height: 48px; background: #0f766e; border-radius: 16px; text-align: center; vertical-align: middle;">
+                <span style="color: white; font-size: 20px; font-weight: 900; line-height: 48px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">E</span>
+              </td>
+            </tr>
+          </table>
           <p style="margin: 0; font-size: 13px; font-weight: 600; color: #475569; letter-spacing: 0.05em;">E-FFICIENT ANALYTICS</p>
         </div>
 
         <h1 style="font-size: 22px; font-weight: 700; color: #0f172a; margin: 0 0 8px;">You've been invited</h1>
         <p style="font-size: 15px; color: #64748b; margin: 0 0 32px;">
-          Hi ${name}, you've been given access to your E-fficient Analytics dashboard.
-          Click below to set up your account — this link expires in 7 days.
+          Hi ${greeting}, you've been given access to E-fficient Analytics.
+          Click below to sign in — this link expires in 7 days.
         </p>
 
         <a href="${link}" style="display: block; text-align: center; background: #0f766e; color: white; text-decoration: none; padding: 14px 24px; border-radius: 12px; font-size: 15px; font-weight: 600; margin-bottom: 24px;">
@@ -93,70 +92,6 @@ async function sendInviteEmail(env, { email, token, dealerName }) {
   }
 }
 
-// ── Policy summary ────────────────────────────────────────────────────────────
-
-async function queryPolicySummary(env, dealerKey = null) {
-  if (!env.DB) throw new Error('D1 database not bound — check wrangler.toml');
-
-  const whereClause = dealerKey ? `WHERE dealer_key = ?` : '';
-  const params      = dealerKey ? [dealerKey] : [];
-
-  const totalsResult = await env.DB.prepare(`
-    SELECT
-      dealer_key, finance_type,
-      COUNT(*) as total_policies,
-      COUNT(CASE WHEN finance_status = 'PAID OUT' THEN 1 END) as paid_out,
-      COUNT(CASE WHEN finance_status = 'DECLINED' THEN 1 END) as declined,
-      COUNT(CASE WHEN transaction_status = 'DELIVERED' THEN 1 END) as delivered,
-      COUNT(CASE WHEN transaction_status = 'DUPLICATE DEAL' THEN 1 END) as duplicate_deals,
-      COUNT(CASE WHEN transaction_status LIKE 'AWAITING%' THEN 1 END) as awaiting_delivery,
-      MIN(created_at) as earliest,
-      MAX(created_at) as latest
-    FROM policy_events
-    ${whereClause}
-    GROUP BY dealer_key, finance_type
-    ORDER BY dealer_key
-  `).bind(...params).all();
-
-  const financeStatusResult = await env.DB.prepare(`
-    SELECT dealer_key, finance_type, finance_company, finance_status, COUNT(*) as count
-    FROM policy_events
-    ${whereClause}
-    GROUP BY dealer_key, finance_type, finance_company, finance_status
-    ORDER BY dealer_key, count DESC
-  `).bind(...params).all();
-
-  const transactionStatusResult = await env.DB.prepare(`
-    SELECT dealer_key, transaction_status, COUNT(*) as count
-    FROM policy_events
-    ${whereClause}
-    GROUP BY dealer_key, transaction_status
-    ORDER BY dealer_key, count DESC
-  `).bind(...params).all();
-
-  const fcWhere  = dealerKey
-    ? `WHERE dealer_key = ? AND finance_company IS NOT NULL`
-    : `WHERE finance_company IS NOT NULL`;
-  const fcParams = dealerKey ? [dealerKey] : [];
-
-  const financeCompanyResult = await env.DB.prepare(`
-    SELECT dealer_key, finance_company,
-      COUNT(*) as count,
-      COUNT(CASE WHEN finance_status = 'PAID OUT' THEN 1 END) as paid_out
-    FROM policy_events
-    ${fcWhere}
-    GROUP BY dealer_key, finance_company
-    ORDER BY dealer_key, count DESC
-  `).bind(...fcParams).all();
-
-  return {
-    totals:            totalsResult.results        || [],
-    financeStatus:     financeStatusResult.results || [],
-    transactionStatus: transactionStatusResult.results || [],
-    financeCompany:    financeCompanyResult.results || [],
-  };
-}
-
 // ── Route handler ─────────────────────────────────────────────────────────────
 
 export async function handleAdmin(request, env, path, method, dealer) {
@@ -170,78 +105,168 @@ export async function handleAdmin(request, env, path, method, dealer) {
 
   const subPath = path.replace('/api/admin', '') || '/';
 
-  // GET /api/admin/dealers — list all dealer users from D1
-  if (subPath === '/dealers' && method === 'GET') {
+  // GET /api/admin/overview — internal team + grouped dealer list
+  if (subPath === '/overview' && method === 'GET') {
     try {
-      const result = await env.DB.prepare(
-        `SELECT id, email, dealer_id, dealer_name, finance_type, is_admin,
-                last_sign_in_at, created_at, status
-         FROM users
-         ORDER BY created_at DESC`
-      ).all();
+      const [internalResult, groupsResult, dealersResult, dealerUsersResult] = await Promise.all([
+        env.DB.prepare(
+          `SELECT id, email, last_sign_in_at, created_at, status FROM users WHERE is_admin = 1 ORDER BY email`
+        ).all(),
+        env.DB.prepare(`SELECT id, name FROM groups ORDER BY name`).all(),
+        env.DB.prepare(`SELECT id, name, group_id, finance_type, has_website FROM dealers ORDER BY name`).all(),
+        env.DB.prepare(
+          `SELECT id, email, dealer_id, group_id, finance_type, last_sign_in_at, created_at, status
+           FROM users WHERE is_admin = 0 ORDER BY email`
+        ).all(),
+      ]);
 
-      const dealers = (result.results || []).map(u => ({
-        id:          u.id,
-        email:       u.email,
-        dealerId:    u.dealer_id,
-        dealerName:  u.dealer_name,
-        financeType: u.finance_type || 'vehicle',
-        isAdmin:     u.is_admin === 1,
-        lastSignIn:  u.last_sign_in_at,
-        createdAt:   u.created_at,
-        status:      u.status || 'invited',
+      const internalUsers = (internalResult.results || []).map(u => ({
+        id:         u.id,
+        email:      u.email,
+        lastSignIn: u.last_sign_in_at,
+        createdAt:  u.created_at,
+        status:     u.status || 'invited',
       }));
 
-      return json({ dealers });
+      const dealers = dealersResult.results || [];
+      const dealerUsers = dealerUsersResult.results || [];
+
+      // Attach users to each dealer (a dealer can have multiple branch users, though usually one)
+      const usersByDealer = {};
+      for (const u of dealerUsers) {
+        if (!u.dealer_id) continue;
+        if (!usersByDealer[u.dealer_id]) usersByDealer[u.dealer_id] = [];
+        usersByDealer[u.dealer_id].push({
+          id:          u.id,
+          email:       u.email,
+          lastSignIn:  u.last_sign_in_at,
+          createdAt:   u.created_at,
+          status:      u.status || 'invited',
+        });
+      }
+
+      // Also track group-level admins (users with group_id set, dealer_id null)
+      const groupAdmins = {};
+      for (const u of dealerUsers) {
+        if (!u.group_id || u.dealer_id) continue;
+        if (!groupAdmins[u.group_id]) groupAdmins[u.group_id] = [];
+        groupAdmins[u.group_id].push({
+          id:          u.id,
+          email:       u.email,
+          lastSignIn:  u.last_sign_in_at,
+          createdAt:   u.created_at,
+          status:      u.status || 'invited',
+        });
+      }
+
+      const dealerNode = (d) => ({
+        id:          d.id,
+        name:        d.name,
+        financeType: d.finance_type,
+        hasWebsite:  d.has_website === 1,
+        users:       usersByDealer[d.id] || [],
+      });
+
+      const groups = (groupsResult.results || []).map(g => ({
+        id:         g.id,
+        name:       g.name,
+        admins:     groupAdmins[g.id] || [],
+        dealers:    dealers.filter(d => d.group_id === g.id).map(dealerNode),
+      }));
+
+      const standaloneDealers = dealers
+        .filter(d => !d.group_id)
+        .map(dealerNode);
+
+      return json({ internalUsers, groups, standaloneDealers });
     } catch (err) {
       return json({ error: err.message }, 500);
     }
   }
 
-  // POST /api/admin/invite — create D1 user + send invite email
+  // POST /api/admin/invite — invite a dealer (branch), group admin, or internal user
   if (subPath === '/invite' && method === 'POST') {
     let body = {};
     try { body = await request.json(); } catch {}
 
-    const { email, dealerId, dealerName, financeType } = body;
+    const {
+      email,
+      inviteType,      // 'dealer' | 'groupAdmin' | 'internal'
+      dealerId,
+      dealerName,
+      financeType,
+      groupId,
+      groupName,
+    } = body;
 
-    if (!email || !dealerId || !dealerName) {
-      return json({ error: 'email, dealerId and dealerName are required' }, 400);
+    if (!email) {
+      return json({ error: 'email is required' }, 400);
     }
 
-    const slug = dealerId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const normalizedEmail = email.toLowerCase().trim();
 
-    // Check if user already exists
     const existing = await env.DB.prepare(
       `SELECT id FROM users WHERE email = ?`
-    ).bind(email.toLowerCase()).first();
+    ).bind(normalizedEmail).first();
 
     if (existing) {
       return json({ error: `${email} already has an account` }, 409);
     }
 
-    const id         = generateId();
-    const token      = generateToken();
-    const expiresAt  = new Date(Date.now() + MAGIC_LINK_EXPIRY_MINUTES * 60 * 1000).toISOString();
+    const id        = generateId();
+    const token     = generateToken();
+    const expiresAt = new Date(Date.now() + MAGIC_LINK_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
     try {
-      await env.DB.prepare(`
-        INSERT INTO users (id, email, dealer_id, dealer_name, finance_type, is_admin, invite_token, invite_expires_at, status)
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'invited')
-      `).bind(id, email.toLowerCase(), slug, dealerName, financeType || 'vehicle', token, expiresAt).run();
+      if (inviteType === 'internal') {
+        await env.DB.prepare(`
+          INSERT INTO users (id, email, is_admin, invite_token, invite_expires_at, status)
+          VALUES (?, ?, 1, ?, ?, 'invited')
+        `).bind(id, normalizedEmail, token, expiresAt).run();
 
-      await sendInviteEmail(env, { email, token, dealerName });
+      } else if (inviteType === 'groupAdmin') {
+        if (!groupId) return json({ error: 'groupId is required for a group admin invite' }, 400);
+
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO groups (id, name) VALUES (?, ?)`
+        ).bind(groupId, groupName || groupId).run();
+
+        await env.DB.prepare(`
+          INSERT INTO users (id, email, group_id, is_admin, role, invite_token, invite_expires_at, status)
+          VALUES (?, ?, ?, 0, 'admin', ?, ?, 'invited')
+        `).bind(id, normalizedEmail, groupId, token, expiresAt).run();
+
+      } else {
+        // Default: dealer (branch-level) invite
+        if (!dealerId || !dealerName) {
+          return json({ error: 'dealerId and dealerName are required for a dealer invite' }, 400);
+        }
+        const slug = dealerId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+        // Ensure the dealer row exists (in case it wasn't onboarded via the automated flow)
+        await env.DB.prepare(`
+          INSERT INTO dealers (id, name, group_id, finance_type, has_website)
+          VALUES (?, ?, ?, ?, 0)
+          ON CONFLICT(id) DO NOTHING
+        `).bind(slug, dealerName, groupId || null, financeType || 'vehicle').run();
+
+        await env.DB.prepare(`
+          INSERT INTO users (id, email, dealer_id, dealer_name, finance_type, is_admin, invite_token, invite_expires_at, status)
+          VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'invited')
+        `).bind(id, normalizedEmail, slug, dealerName, financeType || 'vehicle', token, expiresAt).run();
+      }
+
+      await sendInviteEmail(env, { email: normalizedEmail, token, name: dealerName || groupName || '' });
 
       return json({ success: true, message: `Invite sent to ${email}`, userId: id });
     } catch (err) {
-      // Clean up if email failed
       await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(id).run().catch(() => {});
       return json({ error: err.message }, 500);
     }
   }
 
   // PUT /api/admin/dealers/:id — update dealer metadata
-  const idMatch = subPath.match(/^\/dealers\/([a-zA-Z0-9-]+)$/);
+  const idMatch = subPath.match(/^\/dealers\/([a-zA-Z0-9-_]+)$/);
   if (idMatch && method === 'PUT') {
     const userId = idMatch[1];
     let body = {};
@@ -262,56 +287,12 @@ export async function handleAdmin(request, env, path, method, dealer) {
     }
   }
 
-  // DELETE /api/admin/dealers/:id — remove dealer
+  // DELETE /api/admin/dealers/:id — remove dealer access
   if (idMatch && method === 'DELETE') {
     const userId = idMatch[1];
     try {
       await env.DB.prepare(`DELETE FROM users WHERE id = ? AND is_admin = 0`).bind(userId).run();
-      return json({ success: true, message: 'Dealer removed' });
-    } catch (err) {
-      return json({ error: err.message }, 500);
-    }
-  }
-
-  // GET /api/admin/stats — usage stats from KV cache
-  if (subPath === '/stats' && method === 'GET') {
-    try {
-      const index = await env.CACHE.get('master:index');
-      if (!index) return json({ stats: [] });
-
-      const parsed = JSON.parse(index);
-      const stats  = (parsed.dealers || []).map(d => ({
-        dealerId:    d.dealerSlug,
-        dealerName:  d.dealerName,
-        totalLeads:  d.totalLeads,
-        dateRange:   d.dateRange,
-        processedAt: d.processedAt,
-        financeType: d.financeType,
-      }));
-
-      return json({ stats, generatedAt: parsed.generatedAt });
-    } catch (err) {
-      return json({ error: err.message }, 500);
-    }
-  }
-
-  // GET /api/admin/policies — all dealers
-  if (subPath === '/policies' && method === 'GET') {
-    try {
-      const summary = await queryPolicySummary(env, null);
-      return json(summary);
-    } catch (err) {
-      return json({ error: err.message }, 500);
-    }
-  }
-
-  // GET /api/admin/policies/:dealerKey — single dealer
-  const policyMatch = subPath.match(/^\/policies\/([a-z0-9-]+)$/);
-  if (policyMatch && method === 'GET') {
-    const dealerKey = policyMatch[1];
-    try {
-      const summary = await queryPolicySummary(env, dealerKey);
-      return json({ dealerKey, ...summary });
+      return json({ success: true, message: 'Access removed' });
     } catch (err) {
       return json({ error: err.message }, 500);
     }
