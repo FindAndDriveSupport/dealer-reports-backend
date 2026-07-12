@@ -17,7 +17,7 @@ database_name = "postal-codes-db"
 database_id   = "a518623c-f74b-4889-98da-d9ddda0ff632"
 
 [observability.logs]
-enabled = false
+enabled = true
 invocation_logs = true
 
 [vars]
