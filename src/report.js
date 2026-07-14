@@ -27,6 +27,47 @@ import { json } from './index.js';
 
 const SLUG_RE = /^[a-z0-9-]+$/;
 
+// ─── Applications override — real policy_events count from D1 ────────────────
+// Seriti's "SubmittedOn" field only reflects the widget/journey's own
+// submission flag, not whether a real policy was actually created in Edith.
+// policy_events (D1) is the authoritative record of applications actually
+// created, so this overrides funnel.applicationsSubmitted (and recalculates
+// the Pre-Approval → Application conversion rate) whenever a D1 dealer id
+// is supplied alongside the request.
+async function overrideApplicationsFromPolicies(env, report, dealerId, startDate, endDate) {
+  if (!env.DB || !dealerId) return report;
+
+  const from = startDate || report.meta?.dateRange?.from;
+  const to   = endDate   || report.meta?.dateRange?.to;
+  if (!from || !to) return report;
+
+  try {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
+    ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
+
+    const applicationsSubmitted = row?.count ?? 0;
+    const preApprovals = report.funnel.preApprovals;
+    const preApprovalToApplication = preApprovals > 0
+      ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1)
+      : 0;
+
+    console.log(`[report] Applications overridden from policy_events: ${applicationsSubmitted} (dealer_key=${dealerId})`);
+
+    return {
+      ...report,
+      funnel: {
+        ...report.funnel,
+        applicationsSubmitted,
+        preApprovalToApplication,
+      },
+    };
+  } catch (err) {
+    console.error('[report] policy override failed:', err.message);
+    return report; // fail safe — keep Seriti's numbers if the D1 query errors
+  }
+}
+
 // ─── Cache helpers (KV) ───────────────────────────────────────────────────────
 
 function cacheTtlSeconds(env) {
@@ -246,7 +287,14 @@ export async function handleReport(request, env, path, method, dealer) {
 
     const CACHE_KEY = `dealer:${clientSlug}:${dSlug}`;
     const cached    = await cacheGet(env, CACHE_KEY);
-    if (cached) return json({ ...cached, _cached: true });
+    const d1DealerId = queryParams.dealerId || null;
+
+    if (cached) {
+      const withOverride = await overrideApplicationsFromPolicies(
+        env, cached, d1DealerId, queryParams.startDate, queryParams.endDate
+      );
+      return json({ ...withOverride, _cached: true });
+    }
 
     console.log(`[report] Cache miss for ${clientSlug}/${dSlug} — fetching all from Seriti...`);
     await fetchAndProcessAll(env, {
@@ -262,7 +310,10 @@ export async function handleReport(request, env, path, method, dealer) {
       }, 404);
     }
 
-    return json({ ...report, _cached: false });
+    const withOverride = await overrideApplicationsFromPolicies(
+      env, report, d1DealerId, queryParams.startDate, queryParams.endDate
+    );
+    return json({ ...withOverride, _cached: false });
   }
 
   return json({ error: 'Not found' }, 404);
