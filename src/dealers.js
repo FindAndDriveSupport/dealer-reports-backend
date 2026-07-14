@@ -1,9 +1,10 @@
 /**
- * dealers.js — Dealer access resolution + scoped policy reporting
+ * dealers.js — Dealer access resolution + scoped policy reporting + engagement
  *
  * Routes:
  *   GET /api/dealers/accessible                                — list of dealers the current user can view
  *   GET /api/dealers/:id/policies?startDate=&endDate=          — policy events for one dealer (access-checked, optional date range)
+ *   GET /api/dealers/:id/engagement?startDate=&endDate=        — Mixpanel engagement for one dealer (access-checked)
  *
  * Access rules:
  *   is_admin = true              → all dealers
@@ -14,6 +15,7 @@
  */
 
 import { json } from './index.js';
+import { getEngagementForDealer } from './mixpanel.js';
 
 // ── Access check ──────────────────────────────────────────────────────────────
 
@@ -165,6 +167,28 @@ export async function handleDealers(request, env, path, method, dealer) {
       return json({ dealerKey: targetDealerId, dateRange: startDate && endDate ? { from: startDate, to: endDate } : null, ...summary });
     } catch (err) {
       return json({ error: err.message }, 500);
+    }
+  }
+
+  // GET /api/dealers/:id/engagement?startDate=&endDate= — access-checked Mixpanel engagement
+  // Independent of Seriti's report index — safe to use even while Seriti's API is down.
+  const engagementMatch = subPath.match(/^\/([a-z0-9-_]+)\/engagement$/);
+  if (engagementMatch && method === 'GET') {
+    const targetDealerId = engagementMatch[1];
+
+    const allowed = await canAccessDealer(env, dealer, targetDealerId);
+    if (!allowed) {
+      return json({ error: 'Forbidden — you do not have access to this dealer' }, 403);
+    }
+
+    const startDate = url.searchParams.get('startDate');
+    const endDate   = url.searchParams.get('endDate');
+
+    try {
+      const engagement = await getEngagementForDealer(env, targetDealerId, startDate, endDate);
+      return json(engagement);
+    } catch (err) {
+      return json({ error: err.message }, 502);
     }
   }
 
