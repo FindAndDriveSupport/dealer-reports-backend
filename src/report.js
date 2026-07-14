@@ -238,8 +238,9 @@ export async function handleReport(request, env, path, method, dealer) {
       return json({ error: 'Invalid slug format' }, 400);
     }
 
-    // Security: reject if the requested dealer slug doesn't match the JWT
-    if (dSlug !== dealer.dealerId) {
+    // Security: reject if the requested dealer slug doesn't match the JWT —
+    // admins bypass this since they're allowed to view any dealer's report.
+    if (!dealer?.isAdmin && dSlug !== dealer?.dealerId) {
       return json({ error: 'Forbidden — you can only access your own dealer report' }, 403);
     }
 
