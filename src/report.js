@@ -61,6 +61,13 @@ async function overrideApplicationsFromPolicies(env, report, dealerId, startDate
         applicationsSubmitted,
         preApprovalToApplication,
       },
+      // High Intent in the Intent funnel means the same thing as "an actual
+      // application was submitted" — keep it consistent with the real
+      // policy_events count rather than Seriti's SubmittedOn flag.
+      intent: {
+        ...report.intent,
+        highIntent: applicationsSubmitted,
+      },
     };
   } catch (err) {
     console.error('[report] policy override failed:', err.message);
