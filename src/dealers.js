@@ -14,7 +14,6 @@
  */
 
 import { json } from './index.js';
-import { getEngagementForDealer } from './mixpanel.js';
 
 // ── Access check ──────────────────────────────────────────────────────────────
 
@@ -35,9 +34,6 @@ async function canAccessDealer(env, dealer, targetDealerId) {
 
 async function queryPolicySummary(env, dealerKey, startDate, endDate) {
   const hasDateRange = !!(startDate && endDate);
-  // created_at is stored with a 'T' separator (e.g. 2026-06-18T05:22:12.48).
-  // Using a space separator here breaks lexicographic comparison on the end
-  // boundary date, silently excluding same-day records. Match the format.
   const dateClause = hasDateRange ? `AND created_at >= ? AND created_at <= ?` : '';
   const dateParams = hasDateRange ? [`${startDate}T00:00:00`, `${endDate}T23:59:59.999`] : [];
 
@@ -105,19 +101,19 @@ export async function handleDealers(request, env, path, method, dealer) {
 
       if (dealer.isAdmin) {
         const result = await env.DB.prepare(
-          `SELECT id, name, group_id, finance_type, has_website FROM dealers ORDER BY name`
+          `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers ORDER BY name`
         ).all();
         dealers = result.results || [];
 
       } else if (dealer.groupId) {
         const result = await env.DB.prepare(
-          `SELECT id, name, group_id, finance_type, has_website FROM dealers WHERE group_id = ? ORDER BY name`
+          `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE group_id = ? ORDER BY name`
         ).bind(dealer.groupId).all();
         dealers = result.results || [];
 
       } else if (dealer.dealerId) {
         const row = await env.DB.prepare(
-          `SELECT id, name, group_id, finance_type, has_website FROM dealers WHERE id = ?`
+          `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE id = ?`
         ).bind(dealer.dealerId).first();
         dealers = row ? [row] : [{
           id: dealer.dealerId,
@@ -125,6 +121,7 @@ export async function handleDealers(request, env, path, method, dealer) {
           group_id: null,
           finance_type: dealer.financeType,
           has_website: 0,
+          seriti_slug: null,
         }];
 
       } else {
@@ -138,6 +135,10 @@ export async function handleDealers(request, env, path, method, dealer) {
           groupId:     d.group_id,
           financeType: d.finance_type,
           hasWebsite:  d.has_website === 1,
+          // The slug Seriti's raw ClientName gets auto-slugified into —
+          // used to look up funnel/report data, which is keyed by Seriti's
+          // own slug, not the D1 dealer id. Not guaranteed to match `id`.
+          seritiSlug:  d.seriti_slug || null,
         })),
         canSwitchDealer: dealer.isAdmin || !!dealer.groupId,
       });
@@ -164,28 +165,6 @@ export async function handleDealers(request, env, path, method, dealer) {
       return json({ dealerKey: targetDealerId, dateRange: startDate && endDate ? { from: startDate, to: endDate } : null, ...summary });
     } catch (err) {
       return json({ error: err.message }, 500);
-    }
-  }
-
-  // GET /api/dealers/:id/engagement?startDate=&endDate= — access-checked Mixpanel engagement
-  // Independent of Seriti's report index — safe to use even while Seriti's API is down.
-  const engagementMatch = subPath.match(/^\/([a-z0-9-_]+)\/engagement$/);
-  if (engagementMatch && method === 'GET') {
-    const targetDealerId = engagementMatch[1];
-
-    const allowed = await canAccessDealer(env, dealer, targetDealerId);
-    if (!allowed) {
-      return json({ error: 'Forbidden — you do not have access to this dealer' }, 403);
-    }
-
-    const startDate = url.searchParams.get('startDate');
-    const endDate   = url.searchParams.get('endDate');
-
-    try {
-      const engagement = await getEngagementForDealer(env, targetDealerId, startDate, endDate);
-      return json(engagement);
-    } catch (err) {
-      return json({ error: err.message }, 502);
     }
   }
 
