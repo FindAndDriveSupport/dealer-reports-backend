@@ -167,7 +167,7 @@ export async function handleReport(request, env, path, method, dealer) {
   }
 
   // GET /api/report/index
-  // Dealers only see their own entry in the index, not all dealers.
+  // Admins see every dealer; non-admin dealer users only see their own entry.
   if (subPath === '/index' && method === 'GET') {
     const cached = await cacheGet(env, 'master:index');
 
@@ -181,8 +181,17 @@ export async function handleReport(request, env, path, method, dealer) {
     const index = await cacheGet(env, 'master:index');
     if (!index) return json({ error: 'Failed to build dealer index from Seriti API' }, 502);
 
-    // Scope: dealer only sees their own record
-    const dealerEntry = index.dealers.find(d => d.dealerSlug === dealer.dealerId);
+    // Admins bypass scoping entirely — they need to see and switch between
+    // all dealers. (Group/branch-level scoping for the funnel index still
+    // relies on dealerSlug === dealer.dealerId matching, which assumes the
+    // D1 dealer id and Seriti's auto-generated ClientName slug are the same
+    // string — worth reconciling those two ID systems if group/branch users
+    // report seeing an empty index too.)
+    if (dealer?.isAdmin) {
+      return json({ ...index, _cached: !!cached });
+    }
+
+    const dealerEntry = index.dealers.find(d => d.dealerSlug === dealer?.dealerId);
     const scopedIndex = {
       ...index,
       dealers:      dealerEntry ? [dealerEntry] : [],
