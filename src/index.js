@@ -4,7 +4,7 @@
  * Secrets:
  *   SERITI_API_BASE_URL, SERITI_API_KEY_ID, SERITI_API_SECRET
  *   ALLOWED_ORIGINS
- *   MIXPANEL_SERVICE_ACCOUNT_USERNAME, MIXPANEL_SERVICE_ACCOUNT_SECRET, MIXPANEL_PROJECT_ID
+ *   MIXPANEL_API_SECRET
  *   EMAIL_PROVIDER, EMAIL_FROM, EMAIL_FROM_NAME, EMAIL_API_KEY
  *   RESEND_API_KEY
  *   JWT_SECRET
@@ -38,14 +38,25 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
+    // ── Public routes — no JWT required ─────────────────────────────────────
+
     if (path === '/health' && method === 'GET') {
       return json({
         status:    'ok',
         platform:  'Seriti E-fficient API',
-        version:   '4.0.0',
+        version:   '4.1.0',
         runtime:   'Cloudflare Workers',
         timestamp: new Date().toISOString(),
       }, 200, corsHeaders);
+    }
+
+    // Seriti connection health check — deliberately public so it can be used
+    // to verify the raw Seriti connection without needing to be logged in.
+    if (path === '/api/report/health' && method === 'GET') {
+      const response = await handleReport(request, env, path, method, null);
+      const headers  = new Headers(response.headers);
+      Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
+      return new Response(response.body, { status: response.status, headers });
     }
 
     if (path.startsWith('/api/auth')) {
@@ -54,6 +65,8 @@ export default {
       Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
       return new Response(response.body, { status: response.status, headers });
     }
+
+    // ── Refresh — admin JWT required ────────────────────────────────────────
 
     if (path === '/api/report/refresh' && method === 'POST') {
       const response = await withAuth(async (req, e, c, dealer) => {
@@ -65,6 +78,8 @@ export default {
       Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
       return new Response(response.body, { status: response.status, headers });
     }
+
+    // ── Protected routes ────────────────────────────────────────────────────
 
     try {
       let response;
