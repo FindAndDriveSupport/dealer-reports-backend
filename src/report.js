@@ -24,7 +24,7 @@
 import { fetchLeadData, splitByClient, testConnection } from './seritiApiService.js';
 import { processRows, getGrade } from './metricsProcessor.js';
 import { json } from './index.js';
-import { getAccessibleDealerRows } from './dealers.js';
+import { getAccessibleDealerRows, canAccessSeritiSlug } from './dealers.js';
 
 const SLUG_RE = /^[a-z0-9-]+$/;
 
@@ -422,9 +422,12 @@ export async function handleReport(request, env, path, method, dealer) {
       return json({ error: 'Invalid slug format' }, 400);
     }
 
-    // Security: reject if the requested dealer slug doesn't match the JWT —
-    // admins bypass this since they're allowed to view any dealer's report.
-    if (!dealer?.isAdmin && dSlug !== dealer?.dealerId) {
+    // Security: resolve access via D1's seriti_slug mapping — dSlug here is
+    // Seriti's own auto-generated slug, which may differ from the D1 dealer
+    // id string, so a direct dSlug === dealer.dealerId comparison incorrectly
+    // blocks legitimate branch/group users whenever the two don't match.
+    const allowed = await canAccessSeritiSlug(env, dealer, dSlug);
+    if (!allowed) {
       return json({ error: 'Forbidden — you can only access your own dealer report' }, 403);
     }
 
