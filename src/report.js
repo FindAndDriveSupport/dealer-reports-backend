@@ -27,53 +27,13 @@ import { json } from './index.js';
 
 const SLUG_RE = /^[a-z0-9-]+$/;
 
-// ─── Applications override — real policy_events count from D1 ────────────────
-// Seriti's "SubmittedOn" field only reflects the widget/journey's own
-// submission flag, not whether a real policy was actually created in Edith.
-// policy_events (D1) is the authoritative record of applications actually
-// created, so this overrides funnel.applicationsSubmitted (and recalculates
-// the Pre-Approval → Application conversion rate) whenever a D1 dealer id
-// is supplied alongside the request.
-async function overrideApplicationsFromPolicies(env, report, dealerId, startDate, endDate) {
-  if (!env.DB || !dealerId) return report;
-
-  const from = startDate || report.meta?.dateRange?.from;
-  const to   = endDate   || report.meta?.dateRange?.to;
-  if (!from || !to) return report;
-
-  try {
-    const row = await env.DB.prepare(
-      `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
-    ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
-
-    const applicationsSubmitted = row?.count ?? 0;
-    const preApprovals = report.funnel.preApprovals;
-    const preApprovalToApplication = preApprovals > 0
-      ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1)
-      : 0;
-
-    console.log(`[report] Applications overridden from policy_events: ${applicationsSubmitted} (dealer_key=${dealerId})`);
-
-    return {
-      ...report,
-      funnel: {
-        ...report.funnel,
-        applicationsSubmitted,
-        preApprovalToApplication,
-      },
-      // High Intent in the Intent funnel means the same thing as "an actual
-      // application was submitted" — keep it consistent with the real
-      // policy_events count rather than Seriti's SubmittedOn flag.
-      intent: {
-        ...report.intent,
-        highIntent: applicationsSubmitted,
-      },
-    };
-  } catch (err) {
-    console.error('[report] policy override failed:', err.message);
-    return report; // fail safe — keep Seriti's numbers if the D1 query errors
-  }
-}
+// Note: applications numbers now come from policy_events at *processing*
+// time (see fetchAndProcessAll below), baked into the cached report — so
+// Funnel, Intent, and Lead Quality Intelligence all agree by construction.
+// A previous version of this file patched applicationsSubmitted/highIntent
+// after the fact on each request, which left Lead Quality Intelligence
+// (computed deep in metricsProcessor.js from Seriti's own SubmittedOn flag)
+// out of sync with the patched Funnel numbers. Fixed at the source instead.
 
 // ─── Cache helpers (KV) ───────────────────────────────────────────────────────
 
@@ -158,6 +118,30 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
     const dateRange = extractDateRange(rows);
 
     try {
+      // Resolve the real applications count from policy_events (D1) — the
+      // authoritative record of applications actually created in Edith,
+      // rather than trusting Seriti's own SubmittedOn flag. Baked into the
+      // calculation here so Funnel, Intent, and Lead Quality Intelligence
+      // all agree, instead of patching pieces after the fact.
+      let applicationsOverrideCount = null;
+      if (env.DB) {
+        try {
+          const dealerRow = await env.DB.prepare(
+            `SELECT id FROM dealers WHERE seriti_slug = ?`
+          ).bind(slug).first();
+
+          if (dealerRow && dateRange) {
+            const countRow = await env.DB.prepare(
+              `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
+            ).bind(dealerRow.id, `${dateRange.from}T00:00:00`, `${dateRange.to}T23:59:59.999`).first();
+            applicationsOverrideCount = countRow?.count ?? 0;
+            console.log(`[report] Real applications for ${clientName} (dealer_key=${dealerRow.id}): ${applicationsOverrideCount}`);
+          }
+        } catch (d1Err) {
+          console.warn(`[report] Could not resolve policy_events count for ${clientName}: ${d1Err.message} — falling back to Seriti's SubmittedOn`);
+        }
+      }
+
       const analytics = processRows(rows, {
         clientName,
         clientSlug: slug,
@@ -165,6 +149,7 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
         dealerSlug: slug,
         dateRange,
         source:     'seriti-api',
+        applicationsOverrideCount,
       });
 
       await cacheSet(env, `dealer:${slug}:${slug}`, analytics);
@@ -294,14 +279,8 @@ export async function handleReport(request, env, path, method, dealer) {
 
     const CACHE_KEY = `dealer:${clientSlug}:${dSlug}`;
     const cached    = await cacheGet(env, CACHE_KEY);
-    const d1DealerId = queryParams.dealerId || null;
 
-    if (cached) {
-      const withOverride = await overrideApplicationsFromPolicies(
-        env, cached, d1DealerId, queryParams.startDate, queryParams.endDate
-      );
-      return json({ ...withOverride, _cached: true });
-    }
+    if (cached) return json({ ...cached, _cached: true });
 
     console.log(`[report] Cache miss for ${clientSlug}/${dSlug} — fetching all from Seriti...`);
     await fetchAndProcessAll(env, {
@@ -317,10 +296,7 @@ export async function handleReport(request, env, path, method, dealer) {
       }, 404);
     }
 
-    const withOverride = await overrideApplicationsFromPolicies(
-      env, report, d1DealerId, queryParams.startDate, queryParams.endDate
-    );
-    return json({ ...withOverride, _cached: false });
+    return json({ ...report, _cached: false });
   }
 
   return json({ error: 'Not found' }, 404);
