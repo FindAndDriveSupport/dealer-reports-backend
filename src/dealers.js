@@ -5,6 +5,8 @@
  *   GET /api/dealers/accessible                                — list of dealers the current user can view
  *   GET /api/dealers/:id/policies?startDate=&endDate=          — policy events for one dealer (access-checked, optional date range)
  *   GET /api/dealers/:id/engagement?startDate=&endDate=        — Mixpanel engagement for one dealer (access-checked)
+ *   GET /api/dealers/all/policies?startDate=&endDate=          — policy events summed across every accessible dealer
+ *   GET /api/dealers/all/engagement?startDate=&endDate=        — Mixpanel engagement summed across every accessible dealer
  *
  * Access rules:
  *   is_admin = true              → all dealers
@@ -17,7 +19,7 @@
 import { json } from './index.js';
 import { getEngagementForDealer } from './mixpanel.js';
 
-// ── Access check ──────────────────────────────────────────────────────────────
+// ── Access resolution ────────────────────────────────────────────────────────
 
 async function canAccessDealer(env, dealer, targetDealerId) {
   if (dealer.isAdmin) return true;
@@ -30,6 +32,41 @@ async function canAccessDealer(env, dealer, targetDealerId) {
   }
 
   return dealer.dealerId === targetDealerId;
+}
+
+// Full list of dealer rows the current user can see — same access rules as
+// canAccessDealer, but returning full rows rather than a boolean. Shared by
+// the /accessible route and both "all" aggregate routes.
+export async function getAccessibleDealerRows(env, dealer) {
+  if (dealer.isAdmin) {
+    const result = await env.DB.prepare(
+      `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers ORDER BY name`
+    ).all();
+    return result.results || [];
+  }
+
+  if (dealer.groupId) {
+    const result = await env.DB.prepare(
+      `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE group_id = ? ORDER BY name`
+    ).bind(dealer.groupId).all();
+    return result.results || [];
+  }
+
+  if (dealer.dealerId) {
+    const row = await env.DB.prepare(
+      `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE id = ?`
+    ).bind(dealer.dealerId).first();
+    return row ? [row] : [{
+      id: dealer.dealerId,
+      name: dealer.dealerName,
+      group_id: null,
+      finance_type: dealer.financeType,
+      has_website: 0,
+      seriti_slug: null,
+    }];
+  }
+
+  return [];
 }
 
 // ── Policy summary query (with optional date range) ────────────────────────────
@@ -88,6 +125,50 @@ async function queryPolicySummary(env, dealerKey, startDate, endDate) {
   };
 }
 
+// Sums queryPolicySummary results across a set of dealer_keys into one
+// combined shape, matching the same fields the single-dealer version returns.
+async function querySummedPolicySummary(env, dealerKeys, startDate, endDate) {
+  const perDealer = await Promise.all(
+    dealerKeys.map(k => queryPolicySummary(env, k, startDate, endDate))
+  );
+
+  const totals = [];
+  const financeStatus = [];
+  const transactionStatus = [];
+  const financeCompany = [];
+
+  for (const summary of perDealer) {
+    totals.push(...summary.totals);
+    financeStatus.push(...summary.financeStatus);
+    transactionStatus.push(...summary.transactionStatus);
+    financeCompany.push(...summary.financeCompany);
+  }
+
+  // Collapse transaction_status and finance_company across dealers into one
+  // set of totals each (rather than listing every dealer's rows separately),
+  // since this is an aggregate ("totals only") view.
+  const collapseByKey = (rows, key, extraSumKeys = []) => {
+    const map = new Map();
+    for (const row of rows) {
+      const k = row[key] ?? null;
+      if (!map.has(k)) {
+        map.set(k, { [key]: k, count: 0, ...Object.fromEntries(extraSumKeys.map(ek => [ek, 0])) });
+      }
+      const entry = map.get(k);
+      entry.count += row.count || 0;
+      extraSumKeys.forEach(ek => { entry[ek] += row[ek] || 0; });
+    }
+    return [...map.values()].sort((a, b) => b.count - a.count);
+  };
+
+  return {
+    totals, // per-dealer-per-financeType rows — frontend already sums these into KPIs
+    financeStatus:     collapseByKey(financeStatus, 'finance_status'),
+    transactionStatus: collapseByKey(transactionStatus, 'transaction_status'),
+    financeCompany:    collapseByKey(financeCompany, 'finance_company', ['paid_out']),
+  };
+}
+
 // ── Route handler ─────────────────────────────────────────────────────────────
 
 export async function handleDealers(request, env, path, method, dealer) {
@@ -99,36 +180,7 @@ export async function handleDealers(request, env, path, method, dealer) {
   // GET /api/dealers/accessible
   if (subPath === '/accessible' && method === 'GET') {
     try {
-      let dealers;
-
-      if (dealer.isAdmin) {
-        const result = await env.DB.prepare(
-          `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers ORDER BY name`
-        ).all();
-        dealers = result.results || [];
-
-      } else if (dealer.groupId) {
-        const result = await env.DB.prepare(
-          `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE group_id = ? ORDER BY name`
-        ).bind(dealer.groupId).all();
-        dealers = result.results || [];
-
-      } else if (dealer.dealerId) {
-        const row = await env.DB.prepare(
-          `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE id = ?`
-        ).bind(dealer.dealerId).first();
-        dealers = row ? [row] : [{
-          id: dealer.dealerId,
-          name: dealer.dealerName,
-          group_id: null,
-          finance_type: dealer.financeType,
-          has_website: 0,
-          seriti_slug: null,
-        }];
-
-      } else {
-        dealers = [];
-      }
+      const dealers = await getAccessibleDealerRows(env, dealer);
 
       return json({
         dealers: dealers.map(d => ({
@@ -137,15 +189,121 @@ export async function handleDealers(request, env, path, method, dealer) {
           groupId:     d.group_id,
           financeType: d.finance_type,
           hasWebsite:  d.has_website === 1,
-          // The slug Seriti's raw ClientName gets auto-slugified into —
-          // used to look up funnel/report data, which is keyed by Seriti's
-          // own slug, not the D1 dealer id. Not guaranteed to match `id`.
           seritiSlug:  d.seriti_slug || null,
         })),
         canSwitchDealer: dealer.isAdmin || !!dealer.groupId,
       });
     } catch (err) {
       return json({ error: err.message }, 500);
+    }
+  }
+
+  // GET /api/dealers/all/policies?startDate=&endDate= — summed across every accessible dealer
+  // Only meaningful for admins/group admins — canSwitchDealer gates this on the frontend,
+  // but branch users technically only ever have one accessible dealer anyway so this is safe.
+  if (subPath === '/all/policies' && method === 'GET') {
+    try {
+      const dealers = await getAccessibleDealerRows(env, dealer);
+      const dealerKeys = dealers.map(d => d.id);
+
+      const startDate = url.searchParams.get('startDate');
+      const endDate   = url.searchParams.get('endDate');
+
+      const summary = await querySummedPolicySummary(env, dealerKeys, startDate, endDate);
+      return json({
+        dealerKey: 'all',
+        dealerCount: dealerKeys.length,
+        dateRange: startDate && endDate ? { from: startDate, to: endDate } : null,
+        ...summary,
+      });
+    } catch (err) {
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  // GET /api/dealers/all/engagement?startDate=&endDate= — summed across every accessible dealer
+  if (subPath === '/all/engagement' && method === 'GET') {
+    try {
+      const dealers = await getAccessibleDealerRows(env, dealer);
+      const startDate = url.searchParams.get('startDate');
+      const endDate   = url.searchParams.get('endDate');
+
+      const perDealer = await Promise.all(
+        dealers.map(d => getEngagementForDealer(env, d.id, startDate, endDate).catch(() => null))
+      );
+      const valid = perDealer.filter(Boolean);
+
+      // Sum count-based fields across dealers. returnRate/avgVisitsPerVisitor
+      // are recomputed from the summed totals rather than averaged, since a
+      // straight average would misweight dealers with very different volumes.
+      const sumByKey = (arrays, keyField) => {
+        const map = new Map();
+        for (const arr of arrays) {
+          for (const row of arr) {
+            const k = row[keyField];
+            if (!map.has(k)) map.set(k, { ...row, count: 0 });
+            map.get(k).count += row.count;
+          }
+        }
+        const total = [...map.values()].reduce((a, r) => a + r.count, 0);
+        return [...map.values()]
+          .map(r => ({ ...r, percent: total > 0 ? +((r.count / total) * 100).toFixed(1) : 0 }))
+          .sort((a, b) => b.count - a.count);
+      };
+
+      const totalEvents          = valid.reduce((a, e) => a + (e.totalEvents || 0), 0);
+      const totalVisits          = valid.reduce((a, e) => a + (e.totalVisits || 0), 0);
+      const uniqueVisitors       = valid.reduce((a, e) => a + (e.uniqueVisitors || 0), 0);
+      const avgVisitsPerVisitor  = uniqueVisitors > 0 ? +(totalVisits / uniqueVisitors).toFixed(2) : 0;
+      const repeatVisits         = totalVisits - uniqueVisitors;
+      const returnRate           = totalVisits > 0 ? +((repeatVisits / totalVisits) * 100).toFixed(1) : 0;
+
+      // Heatmap: sum per day/hour across dealers
+      const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+      const heatmap = DAYS.map((day, di) => ({
+        day,
+        hours: Array.from({ length: 24 }, (_, hour) => ({
+          hour,
+          count: valid.reduce((a, e) => a + (e.heatmap?.[di]?.hours?.[hour]?.count || 0), 0),
+        })),
+      }));
+
+      const formatHour = (hour) => {
+        if (hour === 0)  return '12:00 AM';
+        if (hour < 12)   return `${hour}:00 AM`;
+        if (hour === 12) return '12:00 PM';
+        return `${hour - 12}:00 PM`;
+      };
+      const peakHours = DAYS.map((day, di) => {
+        const hours   = heatmap[di].hours;
+        const amHours = hours.filter(h => h.hour < 12).sort((a, b) => b.count - a.count);
+        const pmHours = hours.filter(h => h.hour >= 12).sort((a, b) => b.count - a.count);
+        const amPeak  = amHours[0];
+        const pmPeak  = pmHours[0];
+        return {
+          day,
+          amPeak:  amPeak  ? formatHour(amPeak.hour)  : 'N/A',
+          pmPeak:  pmPeak  ? formatHour(pmPeak.hour)  : 'N/A',
+          amCount: amPeak?.count || 0,
+          pmCount: pmPeak?.count || 0,
+        };
+      });
+
+      return json({
+        acquisitionChannels: sumByKey(valid.map(e => e.acquisitionChannels || []), 'channel'),
+        devices:             sumByKey(valid.map(e => e.devices || []), 'type'),
+        provinces:           sumByKey(valid.map(e => e.provinces || []), 'province'),
+        returnRate,
+        uniqueVisitors,
+        totalVisits,
+        avgVisitsPerVisitor,
+        heatmap,
+        peakHours,
+        totalEvents,
+        dealerCount: dealers.length,
+      });
+    } catch (err) {
+      return json({ error: err.message }, 502);
     }
   }
 
@@ -171,7 +329,6 @@ export async function handleDealers(request, env, path, method, dealer) {
   }
 
   // GET /api/dealers/:id/engagement?startDate=&endDate= — access-checked Mixpanel engagement
-  // Independent of Seriti's report index — safe to use even while Seriti's API is down.
   const engagementMatch = subPath.match(/^\/([a-z0-9-_]+)\/engagement$/);
   if (engagementMatch && method === 'GET') {
     const targetDealerId = engagementMatch[1];
