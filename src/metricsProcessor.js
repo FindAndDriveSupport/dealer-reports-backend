@@ -50,7 +50,7 @@ function deduplicateLeads(rows) {
   });
 }
 
-function calculateFunnel(rows) {
+function calculateFunnel(rows, applicationsOverride = null) {
   const unique = deduplicateLeads(rows);
   const total  = unique.length;
 
@@ -62,9 +62,13 @@ function calculateFunnel(rows) {
     r.IdNumber && String(r.IdNumber).trim() !== '' && r.IdNumber !== 'NULL'
   ).length;
 
-  const applicationsSubmitted = unique.filter(r =>
-    r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL'
-  ).length;
+  // policy_events (D1) is the authoritative record of applications actually
+  // created in Edith — overrides Seriti's own SubmittedOn flag when provided.
+  const applicationsSubmitted = applicationsOverride != null
+    ? applicationsOverride
+    : unique.filter(r =>
+        r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL'
+      ).length;
 
   return {
     totalLeads:               total,
@@ -396,7 +400,7 @@ function generateInsights({
 
 // ─── Traffic quality ──────────────────────────────────────────────────────────
 
-function calculateTrafficQuality(rows) {
+function calculateTrafficQuality(rows, applicationsOverride = null) {
   const unique = deduplicateLeads(rows);
   const total  = unique.length;
 
@@ -408,10 +412,13 @@ function calculateTrafficQuality(rows) {
   const confidencePct   = total > 0 ? (mediumHighConfidence / total) * 100 : 0;
   const confidenceScore = scoreConfidence(confidencePct);
 
-  // Application completion (has SubmittedOn)
-  const completed       = unique.filter(r =>
-    r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL'
-  ).length;
+  // Application completion — policy_events (D1) overrides Seriti's
+  // SubmittedOn flag when provided, same source as funnel.applicationsSubmitted.
+  const completed       = applicationsOverride != null
+    ? applicationsOverride
+    : unique.filter(r =>
+        r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL'
+      ).length;
   const completionPct   = total > 0 ? (completed / total) * 100 : 0;
   const completionScore = scoreApplicationCompletion(completionPct);
 
@@ -490,8 +497,8 @@ function calculateApplicantQuality(rows) {
 
 // ─── Overall lead quality intelligence ───────────────────────────────────────
 
-function calculateLeadQualityIntelligence(rows) {
-  const traffic   = calculateTrafficQuality(rows);
+function calculateLeadQualityIntelligence(rows, applicationsOverride = null) {
+  const traffic   = calculateTrafficQuality(rows, applicationsOverride);
   const applicant = calculateApplicantQuality(rows);
 
   const overallWeights = { traffic: 0.40, applicant: 0.60 };
@@ -531,8 +538,8 @@ function calculateLeadQualityIntelligence(rows) {
 
 // ─── Legacy: kept for dataQuality field backward compatibility ────────────────
 
-function calculateLeadQuality(rows) {
-  const lqi = calculateLeadQualityIntelligence(rows);
+function calculateLeadQuality(rows, applicationsOverride = null) {
+  const lqi = calculateLeadQualityIntelligence(rows, applicationsOverride);
   return {
     score:               lqi.score,
     grade:               lqi.grade,
@@ -571,12 +578,16 @@ function calculateLeadQuality(rows) {
   };
 }
 
-function calculateIntent(rows) {
+function calculateIntent(rows, applicationsOverride = null) {
   const unique = deduplicateLeads(rows);
   return {
     lowIntent:    unique.length,
     mediumIntent: unique.filter(r => r.IdNumber    && String(r.IdNumber).trim()    !== '' && r.IdNumber    !== 'NULL').length,
-    highIntent:   unique.filter(r => r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL').length,
+    // High Intent means "an actual application was submitted" — same
+    // policy_events-backed source as funnel.applicationsSubmitted when provided.
+    highIntent:   applicationsOverride != null
+      ? applicationsOverride
+      : unique.filter(r => r.SubmittedOn && String(r.SubmittedOn).trim() !== '' && r.SubmittedOn !== 'NULL').length,
   };
 }
 
@@ -596,8 +607,14 @@ function calculateDealerBreakdown(rows) {
 export function processRows(rows, metadata = {}) {
   if (!rows || rows.length === 0) throw new Error('No data rows provided');
 
-  const lqi = calculateLeadQualityIntelligence(rows);
-  const lq  = calculateLeadQuality(rows); // backward compat
+  // Real policy_events (D1) count, resolved by report.js before calling this
+  // — the single source of truth for "applications" across Funnel, Intent,
+  // and Lead Quality Intelligence. Falls back to Seriti's SubmittedOn flag
+  // wherever this isn't supplied (e.g. dealers with no D1 mapping yet).
+  const applicationsOverride = metadata.applicationsOverrideCount ?? null;
+
+  const lqi = calculateLeadQualityIntelligence(rows, applicationsOverride);
+  const lq  = calculateLeadQuality(rows, applicationsOverride); // backward compat
 
   return {
     meta: {
@@ -610,7 +627,7 @@ export function processRows(rows, metadata = {}) {
       dealerSlug:  metadata.dealerSlug || null,
       source:      metadata.source     || 'seriti-api',
     },
-    funnel:                   calculateFunnel(rows),
+    funnel:                   calculateFunnel(rows, applicationsOverride),
     incomeDistribution:       calculateIncomeDistribution(rows),
     incomeGroups:             calculateIncomeGroups(rows),
     leadQualityIntelligence:  lqi,   // ← new
@@ -623,7 +640,7 @@ export function processRows(rows, metadata = {}) {
       withCreditScore:      lq.leadsWithCreditData,
       confidenceBreakdown:  lq.confidenceBreakdown,
     },
-    intent:             calculateIntent(rows),
+    intent:             calculateIntent(rows, applicationsOverride),
     dealerBreakdown:    calculateDealerBreakdown(rows),
     engagement:         metadata.engagement || null,
   };
