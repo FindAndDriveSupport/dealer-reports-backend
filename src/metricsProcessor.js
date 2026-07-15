@@ -137,7 +137,7 @@ function calculateIncomeGroups(rows) {
 
 // ─── Scoring functions ────────────────────────────────────────────────────────
 
-function getGrade(score) {
+export function getGrade(score) {
   if (score >= 80) return 'A';
   if (score >= 65) return 'B';
   if (score >= 50) return 'C';
