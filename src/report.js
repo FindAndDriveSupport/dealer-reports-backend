@@ -22,8 +22,9 @@
  */
 
 import { fetchLeadData, splitByClient, testConnection } from './seritiApiService.js';
-import { processRows } from './metricsProcessor.js';
+import { processRows, getGrade } from './metricsProcessor.js';
 import { json } from './index.js';
+import { getAccessibleDealerRows } from './dealers.js';
 
 const SLUG_RE = /^[a-z0-9-]+$/;
 
@@ -259,6 +260,128 @@ export async function handleReport(request, env, path, method, dealer) {
       dealers:     dealers.map(d => d.dealerName),
       processedAt: new Date().toISOString(),
     });
+  }
+
+  // GET /api/report/aggregate?startDate=&endDate= — funnel & lead quality
+  // summed/weighted-averaged across every dealer the current user can access.
+  // "Totals only" per scope — insights/biggestOpportunity aren't meaningfully
+  // combinable across dealers, so those come back empty in aggregate mode.
+  if (subPath === '/aggregate' && method === 'GET') {
+    try {
+      const dealerRows = await getAccessibleDealerRows(env, dealer);
+      const seritiSlugs = dealerRows.map(d => d.seriti_slug).filter(Boolean);
+
+      if (seritiSlugs.length === 0) {
+        return json({ error: 'No dealers with a mapped Seriti slug found for this user' }, 404);
+      }
+
+      const reports = [];
+      for (const slug of seritiSlugs) {
+        const cached = await cacheGet(env, `dealer:${slug}:${slug}`);
+        if (cached) reports.push(cached);
+      }
+
+      if (reports.length === 0) {
+        return json({ error: 'No cached report data found — try Refresh data from /admin first' }, 404);
+      }
+
+      // ── Sum funnel + intent ──────────────────────────────────────────────
+      const sumField = (f) => reports.reduce((a, r) => a + (r.funnel?.[f] || 0), 0);
+      const totalLeads           = sumField('totalLeads');
+      const preQualifications    = totalLeads; // same-by-definition rule applies in aggregate too
+      const preApprovals         = sumField('preApprovals');
+      const applicationsSubmitted = sumField('applicationsSubmitted');
+
+      const funnel = {
+        totalLeads,
+        preQualifications,
+        preApprovals,
+        applicationsSubmitted,
+        leadsToPreApproval:       totalLeads   > 0 ? +((preApprovals / totalLeads) * 100).toFixed(1) : 0,
+        preApprovalToApplication: preApprovals > 0 ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1) : 0,
+      };
+
+      const intent = {
+        lowIntent:    totalLeads,
+        mediumIntent: reports.reduce((a, r) => a + (r.intent?.mediumIntent || 0), 0),
+        highIntent:   applicationsSubmitted,
+      };
+
+      // ── Leads-weighted average for Lead Quality Intelligence ────────────
+      const weightedAvg = (getVal) => {
+        const totalWeight = reports.reduce((a, r) => a + (r.funnel?.totalLeads || 0), 0);
+        if (totalWeight === 0) return 0;
+        return reports.reduce((a, r) => a + (getVal(r) * (r.funnel?.totalLeads || 0)), 0) / totalWeight;
+      };
+
+      const trafficScore     = Math.round(weightedAvg(r => r.leadQualityIntelligence?.trafficQuality?.score || 0));
+      const applicantScore   = Math.round(weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.score || 0));
+      const overallScore     = Math.round(trafficScore * 0.40 + applicantScore * 0.60);
+      const confidencePct    = +weightedAvg(r => r.leadQualityIntelligence?.trafficQuality?.confidencePct || 0).toFixed(1);
+      const completionPct    = totalLeads > 0 ? +((applicationsSubmitted / totalLeads) * 100).toFixed(1) : 0;
+      const avgCreditScore   = Math.round(weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.avgCreditScore || 0));
+      const avgDti           = +weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.avgDti || 0).toFixed(1);
+      const avgIncome        = Math.round(weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.avgIncome || 0));
+
+      const leadQualityIntelligence = {
+        score: overallScore,
+        grade: getGrade(overallScore),
+        totalLeads,
+        trafficQuality: {
+          score: trafficScore,
+          grade: getGrade(trafficScore),
+          confidencePct,
+          completionPct,
+        },
+        applicantQuality: {
+          score: applicantScore,
+          grade: getGrade(applicantScore),
+          avgCreditScore,
+          avgDti,
+          avgIncome,
+        },
+        // Per-dealer insights/opportunities don't combine meaningfully into
+        // one aggregate recommendation — left empty by design in this view.
+        insights: [],
+        biggestOpportunity: null,
+      };
+
+      // ── Income distribution/groups — sum counts, recompute percentages ──
+      const incomeLabels = [...new Set(reports.flatMap(r => (r.incomeDistribution || []).map(d => d.label)))];
+      const incomeDistribution = incomeLabels.map(label => {
+        const count = reports.reduce((a, r) =>
+          a + ((r.incomeDistribution || []).find(d => d.label === label)?.count || 0), 0);
+        return { label, count, percentOfTotal: totalLeads > 0 ? +((count / totalLeads) * 100).toFixed(1) : 0 };
+      });
+
+      return json({
+        meta: {
+          processedAt: new Date().toISOString(),
+          totalRows:   reports.reduce((a, r) => a + (r.meta?.totalRows || 0), 0),
+          dateRange:   reports[0]?.meta?.dateRange || null,
+          clientName:  'All dealers',
+          clientSlug:  'all',
+          dealerName:  'All dealers',
+          dealerSlug:  'all',
+          source:      'aggregate',
+        },
+        funnel,
+        incomeDistribution,
+        incomeGroups: [], // per-income-group risk breakdown doesn't combine meaningfully across dealers
+        leadQualityIntelligence,
+        intent,
+        dealerBreakdown: reports.map(r => ({
+          dealer: r.meta?.clientName || 'Unknown',
+          ...r.funnel,
+        })),
+        engagement: null, // fetched separately via /api/dealers/all/engagement
+        dealerCount: reports.length,
+        _cached: true,
+      });
+    } catch (err) {
+      console.error('[report] aggregate error:', err.message);
+      return json({ error: err.message }, 500);
+    }
   }
 
   // GET /api/report/:clientSlug/:dealerSlug
