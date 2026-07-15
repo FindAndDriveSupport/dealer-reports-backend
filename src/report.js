@@ -354,6 +354,34 @@ export async function handleReport(request, env, path, method, dealer) {
         return { label, count, percentOfTotal: totalLeads > 0 ? +((count / totalLeads) * 100).toFixed(1) : 0 };
       });
 
+      // Income Group Analysis — sum user counts per group, weighted-average
+      // the risk metrics (credit score, DTI, approval rate, etc.) by each
+      // dealer's user count within that group, so a group with more actual
+      // leads has proportionally more influence on the combined average.
+      const groupLabels = [...new Set(reports.flatMap(r => (r.incomeGroups || []).map(g => g.label)))];
+      const incomeGroups = groupLabels.map(label => {
+        const groupRows = reports
+          .map(r => (r.incomeGroups || []).find(g => g.label === label))
+          .filter(Boolean);
+
+        const users = groupRows.reduce((a, g) => a + (g.users || 0), 0);
+        const weightedAvgGroup = (getVal) => {
+          if (users === 0) return 0;
+          return groupRows.reduce((a, g) => a + (getVal(g) * (g.users || 0)), 0) / users;
+        };
+
+        return {
+          label,
+          users,
+          percentOfTotal:       totalLeads > 0 ? +((users / totalLeads) * 100).toFixed(1) : 0,
+          avgNetIncome:         Math.round(weightedAvgGroup(g => g.avgNetIncome || 0)),
+          avgEstimatedApproval: Math.round(weightedAvgGroup(g => g.avgEstimatedApproval || 0)),
+          approvalRate:         +weightedAvgGroup(g => g.approvalRate || 0).toFixed(1),
+          avgCreditScore:       Math.round(weightedAvgGroup(g => g.avgCreditScore || 0)),
+          avgDebtLevel:         +weightedAvgGroup(g => g.avgDebtLevel || 0).toFixed(1),
+        };
+      });
+
       return json({
         meta: {
           processedAt: new Date().toISOString(),
@@ -367,7 +395,7 @@ export async function handleReport(request, env, path, method, dealer) {
         },
         funnel,
         incomeDistribution,
-        incomeGroups: [], // per-income-group risk breakdown doesn't combine meaningfully across dealers
+        incomeGroups,
         leadQualityIntelligence,
         intent,
         dealerBreakdown: reports.map(r => ({
