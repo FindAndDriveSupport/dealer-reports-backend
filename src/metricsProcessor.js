@@ -54,9 +54,10 @@ function calculateFunnel(rows, applicationsOverride = null) {
   const unique = deduplicateLeads(rows);
   const total  = unique.length;
 
-  const preQualifications = unique.filter(r =>
-    r.ChancesOfApproval && r.ChancesOfApproval !== 'NULL'
-  ).length;
+  // Step 1 of the widget IS the pre-qualification (Seriti's affordability
+  // check runs immediately on entry) — every lead is a pre-qual by
+  // definition, not a filtered subset of leads with a ChancesOfApproval value.
+  const preQualifications = total;
 
   const preApprovals = unique.filter(r =>
     r.IdNumber && String(r.IdNumber).trim() !== '' && r.IdNumber !== 'NULL'
