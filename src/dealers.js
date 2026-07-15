@@ -21,7 +21,7 @@ import { getEngagementForDealer } from './mixpanel.js';
 
 // ── Access resolution ────────────────────────────────────────────────────────
 
-async function canAccessDealer(env, dealer, targetDealerId) {
+export async function canAccessDealer(env, dealer, targetDealerId) {
   if (dealer.isAdmin) return true;
 
   if (dealer.groupId) {
@@ -32,6 +32,25 @@ async function canAccessDealer(env, dealer, targetDealerId) {
   }
 
   return dealer.dealerId === targetDealerId;
+}
+
+// Report.js's funnel/lead-quality data is keyed by Seriti's own auto-slug
+// (clientSlug === dealerSlug), which may differ from the D1 dealer id — see
+// seriti_slug backfill. This resolves access the same way as
+// canAccessDealer, but starting from the Seriti slug in the URL instead of
+// the D1 id, so branch and group users aren't incorrectly blocked just
+// because the two id systems don't match as strings.
+export async function canAccessSeritiSlug(env, dealer, seritiSlug) {
+  if (dealer.isAdmin) return true;
+
+  const row = await env.DB.prepare(
+    `SELECT id, group_id FROM dealers WHERE seriti_slug = ?`
+  ).bind(seritiSlug).first();
+
+  if (!row) return false;
+
+  if (dealer.groupId) return row.group_id === dealer.groupId;
+  return dealer.dealerId === row.id;
 }
 
 // Full list of dealer rows the current user can see — same access rules as
