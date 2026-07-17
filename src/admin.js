@@ -5,9 +5,14 @@
  *
  * Routes:
  *   GET  /api/admin/overview           — internal team + grouped dealer list
- *   POST /api/admin/invite             — invite a new dealer or internal user
- *   PUT  /api/admin/dealers/:id        — update dealer metadata
- *   DELETE /api/admin/dealers/:id      — remove dealer access
+ *   POST /api/admin/invite             — invite a new dealer (multi-branch), group admin, or internal user
+ *   PUT  /api/admin/dealers/:id        — update a dealer user's branch access + metadata
+ *   DELETE /api/admin/dealers/:id      — remove a user's access entirely
+ *
+ * Multi-branch access: a dealer/branch user's real access comes from
+ * user_dealer_access (one row per granted branch) — users.dealer_id is kept
+ * only as a legacy display convenience (first granted branch), never as the
+ * source of truth. See dealers.js's getAccessibleDealerRows/canAccessDealer.
  */
 
 import { json } from './index.js';
@@ -108,17 +113,28 @@ export async function handleAdmin(request, env, path, method, dealer) {
   // GET /api/admin/overview — internal team + grouped dealer list
   if (subPath === '/overview' && method === 'GET') {
     try {
-      const [internalResult, groupsResult, dealersResult, dealerUsersResult] = await Promise.all([
+      const [internalResult, groupsResult, dealersResult, accessResult] = await Promise.all([
         env.DB.prepare(
           `SELECT id, email, last_sign_in_at, created_at, status FROM users WHERE is_admin = 1 ORDER BY email`
         ).all(),
         env.DB.prepare(`SELECT id, name FROM groups ORDER BY name`).all(),
         env.DB.prepare(`SELECT id, name, group_id, finance_type, has_website FROM dealers ORDER BY name`).all(),
-        env.DB.prepare(
-          `SELECT id, email, dealer_id, group_id, finance_type, last_sign_in_at, created_at, status
-           FROM users WHERE is_admin = 0 ORDER BY email`
-        ).all(),
+        // Multi-branch aware: join user_dealer_access → users, so a user
+        // granted access to several branches appears under each of them.
+        env.DB.prepare(`
+          SELECT uda.dealer_id, u.id, u.email, u.last_sign_in_at, u.created_at, u.status
+          FROM user_dealer_access uda
+          INNER JOIN users u ON u.id = uda.user_id
+          WHERE u.is_admin = 0
+          ORDER BY u.email
+        `).all(),
       ]);
+
+      // Group-level admins are separate — they have group_id set, no dealer_id/junction rows
+      const groupAdminsResult = await env.DB.prepare(
+        `SELECT id, email, group_id, last_sign_in_at, created_at, status
+         FROM users WHERE is_admin = 0 AND group_id IS NOT NULL`
+      ).all();
 
       const internalUsers = (internalResult.results || []).map(u => ({
         id:         u.id,
@@ -129,26 +145,23 @@ export async function handleAdmin(request, env, path, method, dealer) {
       }));
 
       const dealers = dealersResult.results || [];
-      const dealerUsers = dealerUsersResult.results || [];
+      const accessRows = accessResult.results || [];
+      const groupAdminRows = groupAdminsResult.results || [];
 
-      // Attach users to each dealer (a dealer can have multiple branch users, though usually one)
       const usersByDealer = {};
-      for (const u of dealerUsers) {
-        if (!u.dealer_id) continue;
-        if (!usersByDealer[u.dealer_id]) usersByDealer[u.dealer_id] = [];
-        usersByDealer[u.dealer_id].push({
-          id:          u.id,
-          email:       u.email,
-          lastSignIn:  u.last_sign_in_at,
-          createdAt:   u.created_at,
-          status:      u.status || 'invited',
+      for (const row of accessRows) {
+        if (!usersByDealer[row.dealer_id]) usersByDealer[row.dealer_id] = [];
+        usersByDealer[row.dealer_id].push({
+          id:          row.id,
+          email:       row.email,
+          lastSignIn:  row.last_sign_in_at,
+          createdAt:   row.created_at,
+          status:      row.status || 'invited',
         });
       }
 
-      // Also track group-level admins (users with group_id set, dealer_id null)
       const groupAdmins = {};
-      for (const u of dealerUsers) {
-        if (!u.group_id || u.dealer_id) continue;
+      for (const u of groupAdminRows) {
         if (!groupAdmins[u.group_id]) groupAdmins[u.group_id] = [];
         groupAdmins[u.group_id].push({
           id:          u.id,
@@ -184,7 +197,7 @@ export async function handleAdmin(request, env, path, method, dealer) {
     }
   }
 
-  // POST /api/admin/invite — invite a dealer (branch), group admin, or internal user
+  // POST /api/admin/invite — invite a dealer (one or more branches), group admin, or internal user
   if (subPath === '/invite' && method === 'POST') {
     let body = {};
     try { body = await request.json(); } catch {}
@@ -192,8 +205,8 @@ export async function handleAdmin(request, env, path, method, dealer) {
     const {
       email,
       inviteType,      // 'dealer' | 'groupAdmin' | 'internal'
-      dealerId,
-      dealerName,
+      dealerIds,        // string[] — one or more D1 dealer ids for a 'dealer' invite
+      dealerName,       // used only when a dealerId doesn't already exist as a dealers row
       financeType,
       groupId,
       groupName,
@@ -237,23 +250,35 @@ export async function handleAdmin(request, env, path, method, dealer) {
         `).bind(id, normalizedEmail, groupId, token, expiresAt).run();
 
       } else {
-        // Default: dealer (branch-level) invite
-        if (!dealerId || !dealerName) {
-          return json({ error: 'dealerId and dealerName are required for a dealer invite' }, 400);
+        // Dealer/branch invite — one or more branches via user_dealer_access.
+        const ids = Array.isArray(dealerIds) ? dealerIds.filter(Boolean) : [];
+        if (ids.length === 0) {
+          return json({ error: 'At least one dealerId is required for a dealer invite' }, 400);
         }
-        const slug = dealerId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 
-        // Ensure the dealer row exists (in case it wasn't onboarded via the automated flow)
-        await env.DB.prepare(`
-          INSERT INTO dealers (id, name, group_id, finance_type, has_website)
-          VALUES (?, ?, ?, ?, 0)
-          ON CONFLICT(id) DO NOTHING
-        `).bind(slug, dealerName, groupId || null, financeType || 'vehicle').run();
+        const slugs = ids.map(d => d.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''));
 
+        // users.dealer_id/dealer_name kept only as a legacy display
+        // convenience (first granted branch) — real access is the junction
+        // rows below, checked first by dealers.js.
+        const primarySlug = slugs[0];
         await env.DB.prepare(`
           INSERT INTO users (id, email, dealer_id, dealer_name, finance_type, is_admin, invite_token, invite_expires_at, status)
           VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'invited')
-        `).bind(id, normalizedEmail, slug, dealerName, financeType || 'vehicle', token, expiresAt).run();
+        `).bind(id, normalizedEmail, primarySlug, dealerName || primarySlug, financeType || 'vehicle', token, expiresAt).run();
+
+        for (const slug of slugs) {
+          // Ensure the dealer row exists (in case it wasn't onboarded via the automated flow)
+          await env.DB.prepare(`
+            INSERT INTO dealers (id, name, group_id, finance_type, has_website)
+            VALUES (?, ?, ?, ?, 0)
+            ON CONFLICT(id) DO NOTHING
+          `).bind(slug, dealerName || slug, groupId || null, financeType || 'vehicle').run();
+
+          await env.DB.prepare(
+            `INSERT OR IGNORE INTO user_dealer_access (user_id, dealer_id) VALUES (?, ?)`
+          ).bind(id, slug).run();
+        }
       }
 
       await sendInviteEmail(env, { email: normalizedEmail, token, name: dealerName || groupName || '' });
@@ -261,36 +286,53 @@ export async function handleAdmin(request, env, path, method, dealer) {
       return json({ success: true, message: `Invite sent to ${email}`, userId: id });
     } catch (err) {
       await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(id).run().catch(() => {});
+      await env.DB.prepare(`DELETE FROM user_dealer_access WHERE user_id = ?`).bind(id).run().catch(() => {});
       return json({ error: err.message }, 500);
     }
   }
 
-  // PUT /api/admin/dealers/:id — update dealer metadata
+  // PUT /api/admin/dealers/:id — replace a user's branch access set + metadata
   const idMatch = subPath.match(/^\/dealers\/([a-zA-Z0-9-_]+)$/);
   if (idMatch && method === 'PUT') {
     const userId = idMatch[1];
     let body = {};
     try { body = await request.json(); } catch {}
 
-    const { dealerId, dealerName, financeType } = body;
-    if (!dealerId || !dealerName) {
-      return json({ error: 'dealerId and dealerName are required' }, 400);
+    const { dealerIds, dealerName, financeType } = body;
+    const ids = Array.isArray(dealerIds) ? dealerIds.filter(Boolean) : [];
+
+    if (ids.length === 0) {
+      return json({ error: 'At least one dealerId is required' }, 400);
     }
 
     try {
+      // Replace-set semantics: clear existing grants, insert the new set.
+      await env.DB.prepare(`DELETE FROM user_dealer_access WHERE user_id = ?`).bind(userId).run();
+
+      for (const rawId of ids) {
+        const slug = rawId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO user_dealer_access (user_id, dealer_id) VALUES (?, ?)`
+        ).bind(userId, slug).run();
+      }
+
+      // Update legacy display fields to the first branch in the new set
+      const primarySlug = ids[0].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       await env.DB.prepare(`
         UPDATE users SET dealer_id = ?, dealer_name = ?, finance_type = ? WHERE id = ?
-      `).bind(dealerId, dealerName, financeType || 'vehicle', userId).run();
-      return json({ success: true, message: `Dealer ${dealerName} updated` });
+      `).bind(primarySlug, dealerName || primarySlug, financeType || 'vehicle', userId).run();
+
+      return json({ success: true, message: `Access updated (${ids.length} branch${ids.length === 1 ? '' : 'es'})` });
     } catch (err) {
       return json({ error: err.message }, 500);
     }
   }
 
-  // DELETE /api/admin/dealers/:id — remove dealer access
+  // DELETE /api/admin/dealers/:id — remove a user's access entirely
   if (idMatch && method === 'DELETE') {
     const userId = idMatch[1];
     try {
+      await env.DB.prepare(`DELETE FROM user_dealer_access WHERE user_id = ?`).bind(userId).run();
       await env.DB.prepare(`DELETE FROM users WHERE id = ? AND is_admin = 0`).bind(userId).run();
       return json({ success: true, message: 'Access removed' });
     } catch (err) {
