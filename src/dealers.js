@@ -20,6 +20,12 @@ import { json } from './index.js';
 import { getEngagementForDealer } from './mixpanel.js';
 
 // ── Access resolution ────────────────────────────────────────────────────────
+//
+// Multi-branch access: a user can be granted access to any number of
+// specific dealer branches via user_dealer_access, independent of group
+// membership — e.g. someone who needs exactly 3 branches across 2 different
+// groups. This sits alongside (not replacing) is_admin and group_id, which
+// remain the simplest/broadest access grants.
 
 export async function canAccessDealer(env, dealer, targetDealerId) {
   if (dealer.isAdmin) return true;
@@ -28,9 +34,16 @@ export async function canAccessDealer(env, dealer, targetDealerId) {
     const row = await env.DB.prepare(
       `SELECT id FROM dealers WHERE id = ? AND group_id = ?`
     ).bind(targetDealerId, dealer.groupId).first();
-    return !!row;
+    if (row) return true;
   }
 
+  const grant = await env.DB.prepare(
+    `SELECT 1 FROM user_dealer_access WHERE user_id = ? AND dealer_id = ?`
+  ).bind(dealer.userId, targetDealerId).first();
+  if (grant) return true;
+
+  // Legacy fallback — pre-migration users.dealer_id, in case the backfill
+  // hasn't run yet or a row was created outside the normal invite flow.
   return dealer.dealerId === targetDealerId;
 }
 
@@ -49,13 +62,21 @@ export async function canAccessSeritiSlug(env, dealer, seritiSlug) {
 
   if (!row) return false;
 
-  if (dealer.groupId) return row.group_id === dealer.groupId;
+  if (dealer.groupId && row.group_id === dealer.groupId) return true;
+
+  const grant = await env.DB.prepare(
+    `SELECT 1 FROM user_dealer_access WHERE user_id = ? AND dealer_id = ?`
+  ).bind(dealer.userId, row.id).first();
+  if (grant) return true;
+
   return dealer.dealerId === row.id;
 }
 
-// Full list of dealer rows the current user can see — same access rules as
-// canAccessDealer, but returning full rows rather than a boolean. Shared by
-// the /accessible route and both "all" aggregate routes.
+// Full list of dealer rows the current user can see. Admins see everything;
+// group admins see their whole group; everyone else sees exactly the
+// branches granted to them in user_dealer_access (which may span multiple
+// groups or standalone dealers — this is what makes multi-branch access
+// possible without requiring a shared group_id).
 export async function getAccessibleDealerRows(env, dealer) {
   if (dealer.isAdmin) {
     const result = await env.DB.prepare(
@@ -71,6 +92,21 @@ export async function getAccessibleDealerRows(env, dealer) {
     return result.results || [];
   }
 
+  if (dealer.userId) {
+    const result = await env.DB.prepare(`
+      SELECT d.id, d.name, d.group_id, d.finance_type, d.has_website, d.seriti_slug
+      FROM dealers d
+      INNER JOIN user_dealer_access uda ON uda.dealer_id = d.id
+      WHERE uda.user_id = ?
+      ORDER BY d.name
+    `).bind(dealer.userId).all();
+
+    if (result.results && result.results.length > 0) {
+      return result.results;
+    }
+  }
+
+  // Legacy fallback — pre-migration users.dealer_id with no junction rows yet
   if (dealer.dealerId) {
     const row = await env.DB.prepare(
       `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE id = ?`
