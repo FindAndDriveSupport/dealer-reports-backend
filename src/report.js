@@ -107,8 +107,12 @@ async function fetchAndProcessAll(env, { startDate, endDate, onlyClientSlug } = 
     return [];
   }
 
-  const clientMap    = splitByClient(allRows);
-  const allClientNames = Object.keys(clientMap);
+  // Grouped by DealershipId (Seriti's stable GUID) rather than ClientName —
+  // this key is now used directly as the cache/URL slug, eliminating the
+  // whole class of bugs where our own slugified ClientName drifted from
+  // whatever got manually typed into D1 (findanddrive vs findndrive, etc.).
+  const clientMap = splitByClient(allRows);
+  const allKeys   = Object.keys(clientMap);
 
   // When onlyClientSlug is set (a single dealer's report was requested and
   // wasn't cached), only that one dealer gets the CPU-heavy processRows()
@@ -117,14 +121,14 @@ async function fetchAndProcessAll(env, { startDate, endDate, onlyClientSlug } = 
   // Worker CPU time limit (503) once the dealer count grew past ~20-30.
   // Full-account refresh (all dealers) still happens via /refresh and the
   // /index route's cache-miss path — this only narrows the targeted case.
-  const clientNames = onlyClientSlug
-    ? allClientNames.filter(name => dealerSlug(name) === onlyClientSlug)
-    : allClientNames;
+  const dealerKeys = onlyClientSlug
+    ? allKeys.filter(key => key === onlyClientSlug)
+    : allKeys;
 
   console.log(
     onlyClientSlug
-      ? `[report] Targeted processing: ${clientNames.join(', ') || '(no match for ' + onlyClientSlug + ')'}`
-      : `[report] Processing ${clientNames.length} dealer(s): ${clientNames.join(', ')}`
+      ? `[report] Targeted processing: ${dealerKeys.join(', ') || '(no match for ' + onlyClientSlug + ')'}`
+      : `[report] Processing ${dealerKeys.length} dealer(s)`
   );
 
   const index = [];
@@ -134,65 +138,66 @@ async function fetchAndProcessAll(env, { startDate, endDate, onlyClientSlug } = 
   // growing dealer count (Alpine Motors' many branches, etc.), sequential
   // awaits here were adding up enough to risk the Worker's CPU time limit
   // on any cache-miss (which reprocesses every dealer, not just one).
-  const overridesByClient = {};
+  // Prefers seriti_dealership_id (the stable GUID) over the legacy
+  // name-based seriti_slug for dealers that have been migrated.
+  const overridesByKey = {};
   if (env.DB) {
-    await Promise.all(clientNames.map(async (clientName) => {
-      const slug      = dealerSlug(clientName);
-      const dateRange = extractDateRange(clientMap[clientName]);
+    await Promise.all(dealerKeys.map(async (key) => {
+      const dateRange = extractDateRange(clientMap[key]);
       if (!dateRange) return;
 
       try {
         const dealerRow = await env.DB.prepare(
-          `SELECT id FROM dealers WHERE seriti_slug = ?`
-        ).bind(slug).first();
+          `SELECT id FROM dealers WHERE seriti_dealership_id = ? OR seriti_slug = ?`
+        ).bind(key, key).first();
 
         if (dealerRow) {
           const countRow = await env.DB.prepare(
             `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
           ).bind(dealerRow.id, `${dateRange.from}T00:00:00`, `${dateRange.to}T23:59:59.999`).first();
-          overridesByClient[clientName] = countRow?.count ?? 0;
-          console.log(`[report] Real applications for ${clientName} (dealer_key=${dealerRow.id}): ${overridesByClient[clientName]}`);
+          overridesByKey[key] = countRow?.count ?? 0;
+          console.log(`[report] Real applications for ${key} (dealer_key=${dealerRow.id}): ${overridesByKey[key]}`);
         }
       } catch (d1Err) {
-        console.warn(`[report] Could not resolve policy_events count for ${clientName}: ${d1Err.message} — falling back to Seriti's SubmittedOn`);
+        console.warn(`[report] Could not resolve policy_events count for ${key}: ${d1Err.message} — falling back to Seriti's SubmittedOn`);
       }
     }));
   }
 
-  for (const clientName of clientNames) {
-    const rows      = clientMap[clientName];
-    const slug      = dealerSlug(clientName);
-    const dateRange = extractDateRange(rows);
+  for (const key of dealerKeys) {
+    const rows        = clientMap[key];
+    const displayName = rows[0]?.ClientName || key;
+    const dateRange   = extractDateRange(rows);
 
     try {
-      const applicationsOverrideCount = overridesByClient[clientName] ?? null;
+      const applicationsOverrideCount = overridesByKey[key] ?? null;
 
       const analytics = processRows(rows, {
-        clientName,
-        clientSlug: slug,
-        dealerName: clientName,
-        dealerSlug: slug,
+        clientName: displayName,
+        clientSlug: key,
+        dealerName: displayName,
+        dealerSlug: key,
         dateRange,
         source:     'seriti-api',
         applicationsOverrideCount,
       });
 
-      await cacheSet(env, `dealer:${slug}:${slug}`, analytics);
+      await cacheSet(env, `dealer:${key}:${key}`, analytics);
 
       index.push({
-        dealerName:  clientName,
-        dealerSlug:  slug,
-        clientName,
-        clientSlug:  slug,
-        financeType:  clientName.toUpperCase() === 'YONDA' ? 'bike' : 'vehicle',
+        dealerName:  displayName,
+        dealerSlug:  key,
+        clientName:  displayName,
+        clientSlug:  key,
+        financeType: displayName.toUpperCase() === 'YONDA' ? 'bike' : 'vehicle',
         totalLeads:  analytics.funnel.totalLeads,
         dateRange,
         processedAt: analytics.meta.processedAt,
       });
 
-      console.log(`[report] ✅ ${clientName} — ${rows.length} rows, ${analytics.funnel.totalLeads} unique leads`);
+      console.log(`[report] ✅ ${displayName} (${key}) — ${rows.length} rows, ${analytics.funnel.totalLeads} unique leads`);
     } catch (err) {
-      console.error(`[report] ❌ ${clientName}: ${err.message}`);
+      console.error(`[report] ❌ ${displayName} (${key}): ${err.message}`);
     }
   }
 
@@ -252,21 +257,26 @@ export async function handleReport(request, env, path, method, dealer) {
     if (!index) return json({ error: 'Failed to build dealer index from Seriti API' }, 502);
 
     // Admins bypass scoping entirely — they need to see and switch between
-    // all dealers. (Group/branch-level scoping for the funnel index still
-    // relies on dealerSlug === dealer.dealerId matching, which assumes the
-    // D1 dealer id and Seriti's auto-generated ClientName slug are the same
-    // string — worth reconciling those two ID systems if group/branch users
-    // report seeing an empty index too.)
+    // all dealers.
     if (dealer?.isAdmin) {
       return json({ ...index, _cached: !!cached });
     }
 
-    const dealerEntry = index.dealers.find(d => d.dealerSlug === dealer?.dealerId);
+    // Non-admins: resolve which Seriti dealer keys (GUIDs) this user can
+    // access via D1, same pattern as canAccessSeritiSlug — comparing raw
+    // dealerSlug (now a GUID) against dealer.dealerId (a D1 dealer id like
+    // "yonda-bike") would never match, since those are different ID systems.
+    const accessibleRows = await getAccessibleDealerRows(env, dealer);
+    const accessibleKeys = new Set(
+      accessibleRows.flatMap(d => [d.seriti_dealership_id, d.seriti_slug].filter(Boolean))
+    );
+    const scopedDealers = index.dealers.filter(d => accessibleKeys.has(d.dealerSlug));
+
     const scopedIndex = {
       ...index,
-      dealers:      dealerEntry ? [dealerEntry] : [],
-      totalDealers: dealerEntry ? 1 : 0,
-      totalClients: dealerEntry ? 1 : 0,
+      dealers:      scopedDealers,
+      totalDealers: scopedDealers.length,
+      totalClients: scopedDealers.length,
       _cached:      !!cached,
     };
 
@@ -305,7 +315,7 @@ export async function handleReport(request, env, path, method, dealer) {
   if (subPath === '/aggregate' && method === 'GET') {
     try {
       const dealerRows = await getAccessibleDealerRows(env, dealer);
-      const seritiSlugs = dealerRows.map(d => d.seriti_slug).filter(Boolean);
+      const seritiSlugs = dealerRows.map(d => d.seriti_dealership_id || d.seriti_slug).filter(Boolean);
 
       if (seritiSlugs.length === 0) {
         return json({ error: 'No dealers with a mapped Seriti slug found for this user' }, 404);
