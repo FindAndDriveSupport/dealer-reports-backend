@@ -22,3 +22,8 @@ invocation_logs = true
 
 [vars]
 CACHE_TTL_MINUTES = "60"
+
+# Background sync — pulls Seriti's data into D1 (seriti_leads) every 30
+# minutes, day-by-day, so live dashboard requests never call Seriti at all.
+[triggers]
+crons = ["*/30 * * * *"]
