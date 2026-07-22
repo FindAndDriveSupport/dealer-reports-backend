@@ -100,7 +100,7 @@ async function fetchAndProcessAll(env, { startDate, endDate, onlyClientSlug } = 
 
   console.log(`[report] Fetching from Seriti API (${dates.startDate} → ${dates.endDate})...`);
 
-  const allRows = await fetchLeadData(env, dates);
+  const allRows = await fetchLeadData(env, dates, onlyClientSlug);
 
   if (!allRows.length) {
     console.warn('[report] Seriti API returned 0 rows for this date range');
