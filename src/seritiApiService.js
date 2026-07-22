@@ -205,12 +205,12 @@ export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipI
 
   // When targeting a single dealer, filter the RAW rows (plain objects,
   // cheap to check a field on) BEFORE running them through normaliseRow —
-  // which builds a ~40-field object per row. Normalizing every row in the
-  // account just to throw away all but one dealer's worth was still
-  // expensive enough to trip the Worker's CPU time limit even after
-  // report.js's per-dealer targeting, since this happens upstream of that.
+  // which builds a ~40-field object per row. Case-insensitive comparison:
+  // Seriti's API may return GUIDs in different casing than what's stored in
+  // D1 (sourced from a separate branches-listing endpoint), and a strict
+  // === comparison silently matched nothing, making every dealer 404/503.
   const filtered = onlyDealershipId
-    ? raw.filter(row => row.dealershipId === onlyDealershipId)
+    ? raw.filter(row => (row.dealershipId || '').toLowerCase() === onlyDealershipId.toLowerCase())
     : raw;
 
   if (onlyDealershipId) {
@@ -230,7 +230,10 @@ export function splitByClient(rows) {
     // whatever got manually stored in D1 ("findndrive"), breaking access for
     // that dealer with no clear error. Falls back to ClientName only if a
     // row is somehow missing the GUID (shouldn't normally happen).
-    const key = row.DealershipId || row.ClientName || 'Unknown';
+    // Lowercased for consistency — Seriti may return GUIDs in different
+    // casing than what's stored in D1, and a case-sensitive key would
+    // silently create a second, never-matched group.
+    const key = row.DealershipId ? row.DealershipId.toLowerCase() : (row.ClientName || 'Unknown');
     if (!map[key]) map[key] = [];
     map[key].push(row);
   });
