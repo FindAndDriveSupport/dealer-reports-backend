@@ -93,7 +93,7 @@ async function getToken(env) {
   return authenticate(env);
 }
 // ─── Fetch reporting data ─────────────────────────────────────────────────────
-async function fetchReportingData(env, { startDate, endDate }) {
+export async function fetchReportingData(env, { startDate, endDate }) {
   const baseUrl = env.SERITI_API_BASE_URL?.replace(/\/$/, '');
   const token   = await getToken(env);
   const params = new URLSearchParams({ startDate, endDate });
@@ -130,7 +130,7 @@ async function fetchReportingData(env, { startDate, endDate }) {
   return res.json();
 }
 // ─── Normalise API row → processor shape ─────────────────────────────────────
-function normaliseRow(row) {
+export function normaliseRow(row) {
   const NULL_GUID   = '00000000-0000-0000-0000-000000000000';
   const isNullGuid  = (v) => !v || v === NULL_GUID;
   const nullIfEmpty = (v) => (!v || v === '' || v === NULL_GUID) ? null : v;
@@ -229,7 +229,7 @@ export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipI
 // the legacy ClientName-based path — kept in sync so the fallback key here
 // matches whatever's stored in D1's seriti_slug for dealers that don't
 // (yet) have a seriti_dealership_id GUID.
-function slugifyClientName(name) {
+export function slugifyClientName(name) {
   return name
     .toLowerCase()
     .trim()
