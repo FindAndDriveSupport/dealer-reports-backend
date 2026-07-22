@@ -196,13 +196,28 @@ function normaliseRow(row) {
   };
 }
 // ─── Exports ──────────────────────────────────────────────────────────────────
-export async function fetchLeadData(env, { startDate, endDate }) {
+export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipId = null) {
   const raw = await fetchReportingData(env, { startDate, endDate });
   if (!Array.isArray(raw)) {
     throw new Error(`Seriti API returned unexpected shape: ${JSON.stringify(raw).slice(0, 200)}`);
   }
   console.log(`[seriti] Received ${raw.length} rows`);
-  return raw.map(normaliseRow);
+
+  // When targeting a single dealer, filter the RAW rows (plain objects,
+  // cheap to check a field on) BEFORE running them through normaliseRow —
+  // which builds a ~40-field object per row. Normalizing every row in the
+  // account just to throw away all but one dealer's worth was still
+  // expensive enough to trip the Worker's CPU time limit even after
+  // report.js's per-dealer targeting, since this happens upstream of that.
+  const filtered = onlyDealershipId
+    ? raw.filter(row => row.dealershipId === onlyDealershipId)
+    : raw;
+
+  if (onlyDealershipId) {
+    console.log(`[seriti] Filtered to ${filtered.length} row(s) for dealershipId=${onlyDealershipId} before normalising`);
+  }
+
+  return filtered.map(normaliseRow);
 }
 
 export function splitByClient(rows) {
