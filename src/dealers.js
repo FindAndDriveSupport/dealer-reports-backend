@@ -56,9 +56,11 @@ export async function canAccessDealer(env, dealer, targetDealerId) {
 export async function canAccessSeritiSlug(env, dealer, seritiSlug) {
   if (dealer.isAdmin) return true;
 
+  // Checks both the stable GUID (seriti_dealership_id, preferred) and the
+  // legacy name-based slug (seriti_slug, for dealers not yet migrated).
   const row = await env.DB.prepare(
-    `SELECT id, group_id FROM dealers WHERE seriti_slug = ?`
-  ).bind(seritiSlug).first();
+    `SELECT id, group_id FROM dealers WHERE seriti_dealership_id = ? OR seriti_slug = ?`
+  ).bind(seritiSlug, seritiSlug).first();
 
   if (!row) return false;
 
@@ -80,14 +82,14 @@ export async function canAccessSeritiSlug(env, dealer, seritiSlug) {
 export async function getAccessibleDealerRows(env, dealer) {
   if (dealer.isAdmin) {
     const result = await env.DB.prepare(
-      `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers ORDER BY name`
+      `SELECT id, name, group_id, finance_type, has_website, seriti_slug, seriti_dealership_id FROM dealers ORDER BY name`
     ).all();
     return result.results || [];
   }
 
   if (dealer.groupId) {
     const result = await env.DB.prepare(
-      `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE group_id = ? ORDER BY name`
+      `SELECT id, name, group_id, finance_type, has_website, seriti_slug, seriti_dealership_id FROM dealers WHERE group_id = ? ORDER BY name`
     ).bind(dealer.groupId).all();
     return result.results || [];
   }
@@ -109,7 +111,7 @@ export async function getAccessibleDealerRows(env, dealer) {
   // Legacy fallback — pre-migration users.dealer_id with no junction rows yet
   if (dealer.dealerId) {
     const row = await env.DB.prepare(
-      `SELECT id, name, group_id, finance_type, has_website, seriti_slug FROM dealers WHERE id = ?`
+      `SELECT id, name, group_id, finance_type, has_website, seriti_slug, seriti_dealership_id FROM dealers WHERE id = ?`
     ).bind(dealer.dealerId).first();
     return row ? [row] : [{
       id: dealer.dealerId,
@@ -118,6 +120,7 @@ export async function getAccessibleDealerRows(env, dealer) {
       finance_type: dealer.financeType,
       has_website: 0,
       seriti_slug: null,
+      seriti_dealership_id: null,
     }];
   }
 
@@ -244,7 +247,10 @@ export async function handleDealers(request, env, path, method, dealer) {
           groupId:     d.group_id,
           financeType: d.finance_type,
           hasWebsite:  d.has_website === 1,
-          seritiSlug:  d.seriti_slug || null,
+          // Prefer the stable GUID (seriti_dealership_id) over the legacy
+          // name-based seriti_slug — frontend treats this as an opaque
+          // identifier and just passes it straight through to the backend.
+          seritiSlug:  d.seriti_dealership_id || d.seriti_slug || null,
         })),
         canSwitchDealer: dealer.isAdmin || !!dealer.groupId,
       });
