@@ -1,272 +1,351 @@
 /**
- * seritiApiService.js — Cloudflare Worker edition
+ * report.js — Cloudflare Worker route handler (D1-backed)
  *
- * Changes from Node version:
- *   • No `import fetch from 'node-fetch'` — fetch is native in Workers
- *   • No process.env — credentials come from `env` passed into each function
- *   • Buffer.from(...base64...) → atob() (Workers have Web Crypto, not Node Buffer)
- *   • Token cache uses Cloudflare KV (env.TOKENS) so it persists across
- *     Worker restarts and is shared between instances.
- *     KV key: "seriti:token"
- *     KV value: JSON { token, expiresAt }
+ * Live Seriti fetching moved OUT of request-time entirely — dashboard
+ * requests now just query D1's seriti_leads table (populated by
+ * seritiSync.js on a schedule + on-demand refresh). This eliminates both
+ * failure modes that plagued the old live-fetch approach:
+ *   - CPU timeout: reprocessing the whole account on every uncached dealer
+ *   - Memory crash (1102): parsing Seriti's full-account JSON payload live
+ *
+ * Routes:
+ *   GET  /api/report/health                    — Seriti connection test (public)
+ *   POST /api/report/refresh                    — trigger a D1 sync (admin only)
+ *   GET  /api/report/index                      — dealer list from D1, access-scoped
+ *   GET  /api/report/aggregate                   — summed/weighted across accessible dealers
+ *   GET  /api/report/:clientSlug/:dealerSlug     — one dealer's funnel/lead-quality report
+ *
+ * D1 binding required: DB
  */
-const TOKEN_KV_KEY    = 'seriti:token';
-const TOKEN_BUFFER_MS = 30_000; // refresh 30s before actual expiry
-// ─── KV token cache helpers ───────────────────────────────────────────────────
-async function getCachedToken(env) {
-  try {
-    const raw = await env.TOKENS.get(TOKEN_KV_KEY);
-    if (!raw) return null;
-    const { token, expiresAt } = JSON.parse(raw);
-    if (Date.now() < expiresAt - TOKEN_BUFFER_MS) return token;
-    return null; // expired
-  } catch {
-    return null;
-  }
-}
-async function setCachedToken(env, token, expiresAt) {
-  // KV TTL is in seconds from now — align it with the token expiry
-  const ttlSeconds = Math.max(60, Math.floor((expiresAt - Date.now()) / 1000));
-  await env.TOKENS.put(
-    TOKEN_KV_KEY,
-    JSON.stringify({ token, expiresAt }),
-    { expirationTtl: ttlSeconds }
-  );
-}
-async function clearCachedToken(env) {
-  await env.TOKENS.delete(TOKEN_KV_KEY);
-}
-// ─── Authenticate ─────────────────────────────────────────────────────────────
-async function authenticate(env) {
-  const baseUrl   = env.SERITI_API_BASE_URL?.replace(/\/$/, '');
-  const apiKeyId  = env.SERITI_API_KEY_ID;
-  const apiSecret = env.SERITI_API_SECRET;
-  if (!baseUrl || !apiKeyId || !apiSecret) {
-    throw new Error('SERITI_API_BASE_URL, SERITI_API_KEY_ID and SERITI_API_SECRET must be set');
-  }
-  console.log('[seriti] Authenticating...');
-  const res = await fetch(`${baseUrl}/Authentication/token`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ ApiKeyId: apiKeyId, ApiSecret: apiSecret }),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Seriti auth failed (${res.status}): ${body}`);
-  }
-  const data = await res.json();
-  // Handle common ASP.NET token response shapes
-  const token =
-    data.token        ||
-    data.accessToken  ||
-    data.access_token ||
-    data.Token        ||
-    data.AccessToken  ||
-    (typeof data === 'string' ? data : null);
-  if (!token) {
-    throw new Error(`Seriti auth succeeded but no token found in response: ${JSON.stringify(data)}`);
-  }
-  // Parse JWT expiry — atob() replaces Buffer.from(..., 'base64') in Workers
-  let expiryMs = 60 * 60 * 1000; // 1 hour default
-  try {
-    const parts   = token.split('.');
-    // JWT uses base64url — pad and replace chars before decoding
-    const b64     = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const padded  = b64 + '=='.slice((b64.length % 4 === 0) ? 4 : b64.length % 4);
-    const payload = JSON.parse(atob(padded));
-    if (payload.exp) {
-      expiryMs = (payload.exp * 1000) - Date.now();
-    }
-  } catch {
-    // Can't parse JWT — use default 1 hour
-  }
 
-  const expiresAt = Date.now() + expiryMs;
-  await setCachedToken(env, token, expiresAt);
-  console.log(`[seriti] Authenticated — token valid for ${Math.round(expiryMs / 60000)} min`);
-  return token;
-}
-// ─── Get valid token (from KV cache or fresh auth) ────────────────────────────
-async function getToken(env) {
-  const cached = await getCachedToken(env);
-  if (cached) return cached;
-  return authenticate(env);
-}
-// ─── Fetch reporting data ─────────────────────────────────────────────────────
-export async function fetchReportingData(env, { startDate, endDate }) {
-  const baseUrl = env.SERITI_API_BASE_URL?.replace(/\/$/, '');
-  const token   = await getToken(env);
-  const params = new URLSearchParams({ startDate, endDate });
-  const url    = `${baseUrl}/Reporting?${params}`;
-  console.log(`[seriti] Fetching reporting data (${startDate} → ${endDate})...`);
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept:        'application/json',
-    },
-  });
-  // Token rejected mid-session — refresh once and retry
-  if (res.status === 401) {
-    console.log('[seriti] Token rejected — refreshing and retrying...');
-    await clearCachedToken(env);
-    const freshToken = await authenticate(env);
-    const retry = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${freshToken}`,
-        Accept:        'application/json',
-      },
-    });
-    if (!retry.ok) {
-      const body = await retry.text();
-      throw new Error(`Seriti API error after token refresh (${retry.status}): ${body}`);
-    }
-    return retry.json();
-  }
+import { testConnection } from './seritiApiService.js';
+import { syncDateRange, importRawRows } from './seritiSync.js';
+import { processRows, getGrade } from './metricsProcessor.js';
+import { json } from './index.js';
+import { getAccessibleDealerRows, canAccessSeritiSlug } from './dealers.js';
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Seriti API error (${res.status}): ${body}`);
-  }
-  return res.json();
-}
-// ─── Normalise API row → processor shape ─────────────────────────────────────
-export function normaliseRow(row) {
-  const NULL_GUID   = '00000000-0000-0000-0000-000000000000';
-  const isNullGuid  = (v) => !v || v === NULL_GUID;
-  const nullIfEmpty = (v) => (!v || v === '' || v === NULL_GUID) ? null : v;
+const SLUG_RE = /^[a-z0-9-]+$/;
+
+function defaultDateRange() {
+  const to   = new Date();
+  const from = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   return {
-    // Identity
-    ClientName:          row.clientName             || null,
-    ApplicantId:         row.applicantId            || null,
-    FirstName:           (row.firstName || '').trim(),
-    LastName:            (row.lastName  || '').trim(),
-    MobileNumber:        row.mobileNumber           || null,
-    EmailAddress:        nullIfEmpty(row.emailAddress),
-    IdNumber:            nullIfEmpty(row.idNumber),
-    Gender:              nullIfEmpty(row.gender),
-    DateOfBirth:         row.dateOfBirth            || null,
-    MaritalStatus:       row.maritalStatus          || null,
-    Occupation:          nullIfEmpty(row.occupation),
-    AgeGroup:            nullIfEmpty(row.ageGroup),
-    // Dealer
-    DealershipId:        row.dealershipId           || null,
-    DealerShip:          row.dealerShip             || null,
-    ClientId:            row.clientId               || null,
-    // Finance / income
-    GrossIncome:         row.grossIncome            ?? null,
-    NetIncome:           row.netIncome              ?? null,
-    LivingExpenses:      row.livingExpenses         ?? null,
-    BureauExpenses:      row.bureauExpenses         ?? null,
-    CalculatedGross:     row.calculatedGross        ?? null,
-    CalculatedNet:       row.calculatedNet          ?? null,
-    CalculatedLivingExpenses: row.calculatedLivingExpenses ?? null,
-    CalculatedTotalExpenses:  row.calculatedTotalExpenses  ?? null,
-    DisposableIncome:    row.disposableIncome       ?? null,
-    MonthlyFinancingAmount: row.monthlyFinancingAmount ?? null,
-    TotalFinancingAmount:   row.totalFinancingAmount   ?? null,
-    Deposit:             row.deposit                ?? null,
-    // Prediction / approval
-    PredictorConfidence:     row.predictorConfidence    || null,
-    IncomePredictionValue:   row.incomePredictionValue  ?? null,
-    ChancesOfApproval:       row.chancesOfApproval      || null,
-    EstimatedApprovalAmount: row.estimatedApprovalAmount || null,
-    EstimatedFinanceSpend:   row.estimatedFinanceSpend  || null,
-    EstimatedInsuranceSpend: row.estimatedInsuranceSpend || null,
-    ImprovementSuggestion:   row.improvementSuggestion  || null,
-    // Credit — null GUID means no credit check was run
-    CreditScore:    isNullGuid(row.applicantCreditId) ? null : (row.creditScore ?? null),
-    ScoreIndicator: isNullGuid(row.applicantCreditId) ? null : (row.scoreIndicator ?? null),
-    RiskBand:       isNullGuid(row.applicantCreditId) ? null : (row.riskBand ?? null),
-    // Application — null GUID means not submitted
-    SubmittedOn:       isNullGuid(row.carFinanceApplicationId) ? null : (row.submittedOn ?? null),
-    Status:            isNullGuid(row.carFinanceApplicationId) ? null : (row.status ?? null),
-    StatusDescription: isNullGuid(row.carFinanceApplicationId) ? null : (row.statusDescription ?? null),
-    Provider:          row.provider  || null,
-    Reference:         row.reference || null,
-    // Vehicle
-    VehicleDescription: row.vehicleDescription || null,
-    RetailPrice:        row.retailPrice        || null,
-    // Timestamps
-    CreatedAt: row.createdAt || null,
-    CreatedOn: row.createdOn || null,
-    // Profile
-    LSM:                   row.lsm                   || null,
-    ProfileContactAbility: row.profileContactAbility || null,
-    HomeOwnership:         nullIfEmpty(row.homeOwnership),
+    startDate: from.toISOString().split('T')[0],
+    endDate:   to.toISOString().split('T')[0],
   };
 }
-// ─── Exports ──────────────────────────────────────────────────────────────────
-export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipId = null) {
-  const raw = await fetchReportingData(env, { startDate, endDate });
-  if (!Array.isArray(raw)) {
-    throw new Error(`Seriti API returned unexpected shape: ${JSON.stringify(raw).slice(0, 200)}`);
-  }
-  console.log(`[seriti] Received ${raw.length} rows`);
 
-  // When targeting a single dealer, filter the RAW rows (plain objects,
-  // cheap to check a field on) BEFORE running them through normaliseRow —
-  // which builds a ~40-field object per row. This ONLY applies when
-  // onlyDealershipId is a real GUID (dealers with seriti_dealership_id
-  // confirmed in D1, e.g. Alpine Motors branches) — for everyone else, we
-  // fall back to the original proven behavior (normalize everything, group
-  // afterward via splitByClient), since pre-filtering by a slugified
-  // ClientName guess was new, unproven code that broke dealers that used
-  // to work fine under the simple "normalize all, then group by slug"
-  // approach.
-  const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const filtered = (onlyDealershipId && GUID_RE.test(onlyDealershipId))
-    ? raw.filter(row => (row.dealershipId || '').toLowerCase() === onlyDealershipId.toLowerCase())
-    : raw;
+// Applications override — real policy_events count from D1, same as before.
+async function overrideApplicationsFromPolicies(env, report, dealerId, startDate, endDate) {
+  if (!env.DB || !dealerId) return report;
 
-  if (onlyDealershipId && GUID_RE.test(onlyDealershipId)) {
-    console.log(`[seriti] Filtered to ${filtered.length} row(s) for dealershipId=${onlyDealershipId} before normalising`);
-  }
+  const from = startDate || report.meta?.dateRange?.from;
+  const to   = endDate   || report.meta?.dateRange?.to;
+  if (!from || !to) return report;
 
-  return filtered.map(normaliseRow);
-}
-
-// Matches the slugification report.js's dealerSlug() has always used for
-// the legacy ClientName-based path — kept in sync so the fallback key here
-// matches whatever's stored in D1's seriti_slug for dealers that don't
-// (yet) have a seriti_dealership_id GUID.
-export function slugifyClientName(name) {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-export function splitByClient(rows) {
-  const map = {};
-  rows.forEach(row => {
-    // DealershipId is Seriti's stable GUID (carFinanceDealershipBranchId on
-    // their branches endpoint) — unlike ClientName, which is free text and
-    // was the root cause of a recurring class of bug: our own slugification
-    // of ClientName ("FindAndDrive" → "findanddrive") silently drifting from
-    // whatever got manually stored in D1 ("findndrive"), breaking access for
-    // that dealer with no clear error. Falls back to a SLUGIFIED ClientName
-    // only if a row is genuinely missing the GUID — using the raw name
-    // as-is here would fail URL slug validation (spaces/uppercase) and
-    // wouldn't match D1's seriti_slug, which was slugified when it was
-    // originally backfilled.
-    // Lowercased for consistency — Seriti may return GUIDs in different
-    // casing than what's stored in D1, and a case-sensitive key would
-    // silently create a second, never-matched group.
-    const key = row.DealershipId
-      ? row.DealershipId.toLowerCase()
-      : slugifyClientName(row.ClientName || 'unknown');
-    if (!map[key]) map[key] = [];
-    map[key].push(row);
-  });
-  return map;
-}
-
-export async function testConnection(env) {
   try {
-    await authenticate(env);
-    return { ok: true, message: 'Seriti API authenticated successfully' };
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
+    ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
+
+    const applicationsSubmitted = row?.count ?? 0;
+    const preApprovals = report.funnel.preApprovals;
+    const preApprovalToApplication = preApprovals > 0
+      ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1)
+      : 0;
+
+    return {
+      ...report,
+      funnel: { ...report.funnel, applicationsSubmitted, preApprovalToApplication },
+      intent: { ...report.intent, highIntent: applicationsSubmitted },
+    };
   } catch (err) {
-    return { ok: false, message: err.message };
+    console.error('[report] policy override failed:', err.message);
+    return report;
   }
+}
+
+// Fetch one dealer's normalized lead rows from D1 for a date range.
+async function getDealerRowsFromD1(env, dealerKey, startDate, endDate) {
+  const result = await env.DB.prepare(
+    `SELECT data FROM seriti_leads WHERE dealer_key = ? AND lead_date >= ? AND lead_date <= ?`
+  ).bind(dealerKey, startDate, endDate).all();
+
+  return (result.results || []).map(r => {
+    try { return JSON.parse(r.data); } catch { return null; }
+  }).filter(Boolean);
+}
+
+export async function handleReport(request, env, path, method, dealer) {
+  const url         = new URL(request.url);
+  const queryParams = Object.fromEntries(url.searchParams);
+  const subPath      = path.replace('/api/report', '') || '/';
+
+  // GET /api/report/health — public, tests raw Seriti connection
+  if (subPath === '/health' && method === 'GET') {
+    const result = await testConnection(env);
+    return json(result, result.ok ? 200 : 502);
+  }
+
+  if (!env.DB) return json({ error: 'Database not configured' }, 500);
+
+  // POST /api/report/refresh — admin-triggered D1 sync (day-by-day, small payloads)
+  if (subPath === '/refresh' && method === 'POST') {
+    const dates = (queryParams.startDate && queryParams.endDate)
+      ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
+      : defaultDateRange();
+
+    try {
+      const result = await syncDateRange(env, dates.startDate, dates.endDate);
+      return json({
+        success: true,
+        message: `Synced ${result.totalRows} row(s) across ${result.days} day(s)${result.failures > 0 ? ` (${result.failures} day(s) failed — check logs)` : ''}`,
+        ...result,
+      });
+    } catch (err) {
+      console.error('[report] refresh failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  // POST /api/report/import — bulk-load a pre-fetched Seriti JSON export
+  // directly into D1, skipping live Seriti calls entirely. Body is the raw
+  // JSON array exactly as Seriti's /Reporting endpoint returns it. Admin only.
+  if (subPath === '/import' && method === 'POST') {
+    if (!dealer?.isAdmin) return json({ error: 'Forbidden — admin access only' }, 403);
+
+    try {
+      const rawRows = await request.json();
+      const result = await importRawRows(env, rawRows);
+      return json({
+        success: true,
+        message: `Imported ${result.imported} lead(s)${result.skipped > 0 ? `, skipped ${result.skipped} (missing applicantId)` : ''}`,
+        ...result,
+      });
+    } catch (err) {
+      console.error('[report] import failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  // GET /api/report/index — dealer list from D1, access-scoped
+  if (subPath === '/index' && method === 'GET') {
+    const dates = (queryParams.startDate && queryParams.endDate)
+      ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
+      : defaultDateRange();
+
+    try {
+      const result = await env.DB.prepare(`
+        SELECT dealer_key, display_name, COUNT(*) as totalLeads, MAX(synced_at) as processedAt
+        FROM seriti_leads
+        WHERE lead_date >= ? AND lead_date <= ?
+        GROUP BY dealer_key
+        ORDER BY display_name
+      `).bind(dates.startDate, dates.endDate).all();
+
+      const allDealers = (result.results || []).map(r => ({
+        dealerName:  r.display_name || r.dealer_key,
+        dealerSlug:  r.dealer_key,
+        clientName:  r.display_name || r.dealer_key,
+        clientSlug:  r.dealer_key,
+        financeType: (r.display_name || '').toUpperCase().includes('YONDA') ? 'bike' : 'vehicle',
+        totalLeads:  r.totalLeads,
+        dateRange:   dates,
+        processedAt: r.processedAt,
+      }));
+
+      let scopedDealers = allDealers;
+      if (!dealer?.isAdmin) {
+        const accessibleRows = await getAccessibleDealerRows(env, dealer);
+        const accessibleKeys = new Set(
+          accessibleRows.flatMap(d => [d.seriti_dealership_id, d.seriti_slug].filter(Boolean).map(s => s.toLowerCase()))
+        );
+        scopedDealers = allDealers.filter(d => accessibleKeys.has(d.dealerSlug.toLowerCase()));
+      }
+
+      return json({
+        platform:     'Seriti E-fficient',
+        generatedAt:  new Date().toISOString(),
+        totalClients: scopedDealers.length,
+        totalDealers: scopedDealers.length,
+        dateRange:    dates,
+        dealers:      scopedDealers,
+      });
+    } catch (err) {
+      console.error('[report] index failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  // GET /api/report/aggregate — summed/weighted across every accessible dealer
+  if (subPath === '/aggregate' && method === 'GET') {
+    try {
+      const dates = (queryParams.startDate && queryParams.endDate)
+        ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
+        : defaultDateRange();
+
+      const dealerRows  = await getAccessibleDealerRows(env, dealer);
+      const dealerKeys  = dealerRows.flatMap(d => [d.seriti_dealership_id, d.seriti_slug].filter(Boolean));
+
+      if (dealerKeys.length === 0) {
+        return json({ error: 'No dealers found for this user' }, 404);
+      }
+
+      const reports = [];
+      for (const key of dealerKeys) {
+        const rows = await getDealerRowsFromD1(env, key, dates.startDate, dates.endDate);
+        if (rows.length === 0) continue;
+        const analytics = processRows(rows, {
+          clientName: key, clientSlug: key, dealerName: key, dealerSlug: key,
+          dateRange: dates, source: 'd1',
+        });
+        reports.push(analytics);
+      }
+
+      if (reports.length === 0) {
+        return json({ error: 'No lead data found — try syncing data first via Refresh data' }, 404);
+      }
+
+      const sumField = (f) => reports.reduce((a, r) => a + (r.funnel?.[f] || 0), 0);
+      const totalLeads            = sumField('totalLeads');
+      const preApprovals          = sumField('preApprovals');
+      const applicationsSubmitted = sumField('applicationsSubmitted');
+
+      const funnel = {
+        totalLeads,
+        preQualifications: totalLeads,
+        preApprovals,
+        applicationsSubmitted,
+        leadsToPreApproval:       totalLeads   > 0 ? +((preApprovals / totalLeads) * 100).toFixed(1) : 0,
+        preApprovalToApplication: preApprovals > 0 ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1) : 0,
+      };
+
+      const intent = {
+        lowIntent: totalLeads,
+        mediumIntent: reports.reduce((a, r) => a + (r.intent?.mediumIntent || 0), 0),
+        highIntent: applicationsSubmitted,
+      };
+
+      const weightedAvg = (getVal) => {
+        const totalWeight = reports.reduce((a, r) => a + (r.funnel?.totalLeads || 0), 0);
+        if (totalWeight === 0) return 0;
+        return reports.reduce((a, r) => a + (getVal(r) * (r.funnel?.totalLeads || 0)), 0) / totalWeight;
+      };
+
+      const trafficScore   = Math.round(weightedAvg(r => r.leadQualityIntelligence?.trafficQuality?.score || 0));
+      const applicantScore = Math.round(weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.score || 0));
+      const overallScore   = Math.round(trafficScore * 0.40 + applicantScore * 0.60);
+
+      const leadQualityIntelligence = {
+        score: overallScore,
+        grade: getGrade(overallScore),
+        totalLeads,
+        trafficQuality: {
+          score: trafficScore,
+          grade: getGrade(trafficScore),
+          confidencePct: +weightedAvg(r => r.leadQualityIntelligence?.trafficQuality?.confidencePct || 0).toFixed(1),
+          completionPct: totalLeads > 0 ? +((applicationsSubmitted / totalLeads) * 100).toFixed(1) : 0,
+        },
+        applicantQuality: {
+          score: applicantScore,
+          grade: getGrade(applicantScore),
+          avgCreditScore: Math.round(weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.avgCreditScore || 0)),
+          avgDti:         +weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.avgDti || 0).toFixed(1),
+          avgIncome:      Math.round(weightedAvg(r => r.leadQualityIntelligence?.applicantQuality?.avgIncome || 0)),
+        },
+        insights: [],
+        biggestOpportunity: null,
+      };
+
+      const incomeLabels = [...new Set(reports.flatMap(r => (r.incomeDistribution || []).map(d => d.label)))];
+      const incomeDistribution = incomeLabels.map(label => {
+        const count = reports.reduce((a, r) => a + ((r.incomeDistribution || []).find(d => d.label === label)?.count || 0), 0);
+        return { label, count, percentOfTotal: totalLeads > 0 ? +((count / totalLeads) * 100).toFixed(1) : 0 };
+      });
+
+      const groupLabels = [...new Set(reports.flatMap(r => (r.incomeGroups || []).map(g => g.label)))];
+      const incomeGroups = groupLabels.map(label => {
+        const groupRows = reports.map(r => (r.incomeGroups || []).find(g => g.label === label)).filter(Boolean);
+        const users = groupRows.reduce((a, g) => a + (g.users || 0), 0);
+        const wAvg = (getVal) => users > 0 ? groupRows.reduce((a, g) => a + (getVal(g) * (g.users || 0)), 0) / users : 0;
+        return {
+          label, users,
+          percentOfTotal:       totalLeads > 0 ? +((users / totalLeads) * 100).toFixed(1) : 0,
+          avgNetIncome:         Math.round(wAvg(g => g.avgNetIncome || 0)),
+          avgEstimatedApproval: Math.round(wAvg(g => g.avgEstimatedApproval || 0)),
+          approvalRate:         +wAvg(g => g.approvalRate || 0).toFixed(1),
+          avgCreditScore:       Math.round(wAvg(g => g.avgCreditScore || 0)),
+          avgDebtLevel:         +wAvg(g => g.avgDebtLevel || 0).toFixed(1),
+        };
+      });
+
+      return json({
+        meta: {
+          processedAt: new Date().toISOString(),
+          totalRows: reports.reduce((a, r) => a + (r.meta?.totalRows || 0), 0),
+          dateRange: dates,
+          clientName: 'All dealers', clientSlug: 'all',
+          dealerName: 'All dealers', dealerSlug: 'all',
+          source: 'aggregate',
+        },
+        funnel, incomeDistribution, incomeGroups, leadQualityIntelligence, intent,
+        dealerBreakdown: reports.map(r => ({ dealer: r.meta?.clientName || 'Unknown', ...r.funnel })),
+        engagement: null,
+        dealerCount: reports.length,
+        _cached: false,
+      });
+    } catch (err) {
+      console.error('[report] aggregate failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  // GET /api/report/:clientSlug/:dealerSlug — one dealer's report, from D1
+  const slugMatch = subPath.match(/^\/([a-z0-9-]+)\/([a-z0-9-]+)$/);
+  if (slugMatch && method === 'GET') {
+    const [, rawClientSlug, rawDSlug] = slugMatch;
+
+    if (!SLUG_RE.test(rawClientSlug) || !SLUG_RE.test(rawDSlug)) {
+      return json({ error: 'Invalid slug format' }, 400);
+    }
+
+    const dSlug = rawDSlug.toLowerCase();
+
+    const allowed = await canAccessSeritiSlug(env, dealer, dSlug);
+    if (!allowed) {
+      return json({ error: 'Forbidden — you can only access your own dealer report' }, 403);
+    }
+
+    const dates = (queryParams.startDate && queryParams.endDate)
+      ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
+      : defaultDateRange();
+
+    try {
+      const rows = await getDealerRowsFromD1(env, dSlug, dates.startDate, dates.endDate);
+
+      if (rows.length === 0) {
+        return json({
+          error: `No data found for dealer "${dSlug}" in this date range`,
+          hint:  'Try Refresh data on /admin, or a wider date range',
+        }, 404);
+      }
+
+      const displayName = rows[0]?.ClientName || dSlug;
+      const analytics = processRows(rows, {
+        clientName: displayName, clientSlug: dSlug,
+        dealerName: displayName, dealerSlug: dSlug,
+        dateRange: dates, source: 'd1',
+      });
+
+      const d1DealerId = queryParams.dealerId || null;
+      const withOverride = await overrideApplicationsFromPolicies(env, analytics, d1DealerId, dates.startDate, dates.endDate);
+
+      return json({ ...withOverride, _cached: false });
+    } catch (err) {
+      console.error('[report] dealer report failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  return json({ error: 'Not found' }, 404);
 }
