@@ -56,10 +56,10 @@ export async function canAccessDealer(env, dealer, targetDealerId) {
 export async function canAccessSeritiSlug(env, dealer, seritiSlug) {
   if (dealer.isAdmin) return true;
 
-  // Checks both the stable GUID (seriti_dealership_id, preferred) and the
-  // legacy name-based slug (seriti_slug, for dealers not yet migrated).
+  // Case-insensitive — Seriti's GUID casing isn't guaranteed to match
+  // whatever casing ended up stored in D1.
   const row = await env.DB.prepare(
-    `SELECT id, group_id FROM dealers WHERE seriti_dealership_id = ? OR seriti_slug = ?`
+    `SELECT id, group_id FROM dealers WHERE LOWER(seriti_dealership_id) = LOWER(?) OR LOWER(seriti_slug) = LOWER(?)`
   ).bind(seritiSlug, seritiSlug).first();
 
   if (!row) return false;
