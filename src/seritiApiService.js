@@ -205,12 +205,16 @@ export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipI
 
   // When targeting a single dealer, filter the RAW rows (plain objects,
   // cheap to check a field on) BEFORE running them through normaliseRow —
-  // which builds a ~40-field object per row. Case-insensitive comparison:
-  // Seriti's API may return GUIDs in different casing than what's stored in
-  // D1 (sourced from a separate branches-listing endpoint), and a strict
-  // === comparison silently matched nothing, making every dealer 404/503.
+  // which builds a ~40-field object per row. onlyDealershipId can be either
+  // a real GUID (dealers with seriti_dealership_id set) or a slugified
+  // ClientName (legacy dealers without one yet) — detect which and filter
+  // accordingly, so the fallback-name dealers don't get incorrectly wiped
+  // out by a GUID-shaped comparison that can never match their rows.
+  const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const filtered = onlyDealershipId
-    ? raw.filter(row => (row.dealershipId || '').toLowerCase() === onlyDealershipId.toLowerCase())
+    ? (GUID_RE.test(onlyDealershipId)
+        ? raw.filter(row => (row.dealershipId || '').toLowerCase() === onlyDealershipId.toLowerCase())
+        : raw.filter(row => slugifyClientName(row.clientName || '') === onlyDealershipId))
     : raw;
 
   if (onlyDealershipId) {
@@ -218,6 +222,18 @@ export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipI
   }
 
   return filtered.map(normaliseRow);
+}
+
+// Matches the slugification report.js's dealerSlug() has always used for
+// the legacy ClientName-based path — kept in sync so the fallback key here
+// matches whatever's stored in D1's seriti_slug for dealers that don't
+// (yet) have a seriti_dealership_id GUID.
+function slugifyClientName(name) {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
 }
 
 export function splitByClient(rows) {
@@ -228,12 +244,17 @@ export function splitByClient(rows) {
     // was the root cause of a recurring class of bug: our own slugification
     // of ClientName ("FindAndDrive" → "findanddrive") silently drifting from
     // whatever got manually stored in D1 ("findndrive"), breaking access for
-    // that dealer with no clear error. Falls back to ClientName only if a
-    // row is somehow missing the GUID (shouldn't normally happen).
+    // that dealer with no clear error. Falls back to a SLUGIFIED ClientName
+    // only if a row is genuinely missing the GUID — using the raw name
+    // as-is here would fail URL slug validation (spaces/uppercase) and
+    // wouldn't match D1's seriti_slug, which was slugified when it was
+    // originally backfilled.
     // Lowercased for consistency — Seriti may return GUIDs in different
     // casing than what's stored in D1, and a case-sensitive key would
     // silently create a second, never-matched group.
-    const key = row.DealershipId ? row.DealershipId.toLowerCase() : (row.ClientName || 'Unknown');
+    const key = row.DealershipId
+      ? row.DealershipId.toLowerCase()
+      : slugifyClientName(row.ClientName || 'unknown');
     if (!map[key]) map[key] = [];
     map[key].push(row);
   });
