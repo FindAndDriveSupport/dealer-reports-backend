@@ -205,19 +205,20 @@ export async function fetchLeadData(env, { startDate, endDate }, onlyDealershipI
 
   // When targeting a single dealer, filter the RAW rows (plain objects,
   // cheap to check a field on) BEFORE running them through normaliseRow —
-  // which builds a ~40-field object per row. onlyDealershipId can be either
-  // a real GUID (dealers with seriti_dealership_id set) or a slugified
-  // ClientName (legacy dealers without one yet) — detect which and filter
-  // accordingly, so the fallback-name dealers don't get incorrectly wiped
-  // out by a GUID-shaped comparison that can never match their rows.
+  // which builds a ~40-field object per row. This ONLY applies when
+  // onlyDealershipId is a real GUID (dealers with seriti_dealership_id
+  // confirmed in D1, e.g. Alpine Motors branches) — for everyone else, we
+  // fall back to the original proven behavior (normalize everything, group
+  // afterward via splitByClient), since pre-filtering by a slugified
+  // ClientName guess was new, unproven code that broke dealers that used
+  // to work fine under the simple "normalize all, then group by slug"
+  // approach.
   const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const filtered = onlyDealershipId
-    ? (GUID_RE.test(onlyDealershipId)
-        ? raw.filter(row => (row.dealershipId || '').toLowerCase() === onlyDealershipId.toLowerCase())
-        : raw.filter(row => slugifyClientName(row.clientName || '') === onlyDealershipId))
+  const filtered = (onlyDealershipId && GUID_RE.test(onlyDealershipId))
+    ? raw.filter(row => (row.dealershipId || '').toLowerCase() === onlyDealershipId.toLowerCase())
     : raw;
 
-  if (onlyDealershipId) {
+  if (onlyDealershipId && GUID_RE.test(onlyDealershipId)) {
     console.log(`[seriti] Filtered to ${filtered.length} row(s) for dealershipId=${onlyDealershipId} before normalising`);
   }
 
