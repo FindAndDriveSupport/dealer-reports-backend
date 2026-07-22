@@ -93,7 +93,7 @@ function extractDateRange(rows) {
 
 // ─── Core: fetch from Seriti, process all dealers, populate KV cache ──────────
 
-async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
+async function fetchAndProcessAll(env, { startDate, endDate, onlyClientSlug } = {}) {
   const dates = startDate && endDate
     ? { startDate, endDate }
     : defaultDateRange();
@@ -107,9 +107,25 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
     return [];
   }
 
-  const clientMap   = splitByClient(allRows);
-  const clientNames = Object.keys(clientMap);
-  console.log(`[report] Processing ${clientNames.length} dealer(s): ${clientNames.join(', ')}`);
+  const clientMap    = splitByClient(allRows);
+  const allClientNames = Object.keys(clientMap);
+
+  // When onlyClientSlug is set (a single dealer's report was requested and
+  // wasn't cached), only that one dealer gets the CPU-heavy processRows()
+  // pipeline run — not every dealer in the account. Reprocessing everyone
+  // just because one new/uncached dealer was viewed was hitting Cloudflare's
+  // Worker CPU time limit (503) once the dealer count grew past ~20-30.
+  // Full-account refresh (all dealers) still happens via /refresh and the
+  // /index route's cache-miss path — this only narrows the targeted case.
+  const clientNames = onlyClientSlug
+    ? allClientNames.filter(name => dealerSlug(name) === onlyClientSlug)
+    : allClientNames;
+
+  console.log(
+    onlyClientSlug
+      ? `[report] Targeted processing: ${clientNames.join(', ') || '(no match for ' + onlyClientSlug + ')'}`
+      : `[report] Processing ${clientNames.length} dealer(s): ${clientNames.join(', ')}`
+  );
 
   const index = [];
 
@@ -180,17 +196,29 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
     }
   }
 
+  // When targeted (onlyClientSlug), merge this one dealer into the EXISTING
+  // cached index rather than overwriting it — otherwise every other
+  // dealer would vanish from /api/report/index the next time anyone views
+  // a single uncached dealer's report.
+  let finalDealers = index;
+  if (onlyClientSlug) {
+    const existing = await cacheGet(env, 'master:index');
+    const existingDealers = existing?.dealers || [];
+    const otherDealers = existingDealers.filter(d => d.dealerSlug !== onlyClientSlug);
+    finalDealers = [...otherDealers, ...index];
+  }
+
   const masterIndex = {
     platform:     'Seriti E-fficient',
     generatedAt:  new Date().toISOString(),
-    totalClients: index.length,
-    totalDealers: index.length,
+    totalClients: finalDealers.length,
+    totalDealers: finalDealers.length,
     dateRange:    { startDate: dates.startDate, endDate: dates.endDate },
-    dealers:      index,
+    dealers:      finalDealers,
   };
 
   await cacheSet(env, 'master:index', masterIndex);
-  console.log(`[report] Index cached — ${index.length} dealer(s)`);
+  console.log(`[report] Index cached — ${finalDealers.length} dealer(s) total${onlyClientSlug ? ` (${index.length} just processed)` : ''}`);
 
   return index;
 }
@@ -444,10 +472,11 @@ export async function handleReport(request, env, path, method, dealer) {
 
     if (cached) return json({ ...cached, _cached: true });
 
-    console.log(`[report] Cache miss for ${clientSlug}/${dSlug} — fetching all from Seriti...`);
+    console.log(`[report] Cache miss for ${clientSlug}/${dSlug} — fetching targeted from Seriti...`);
     await fetchAndProcessAll(env, {
       startDate: queryParams.startDate,
       endDate:   queryParams.endDate,
+      onlyClientSlug: dSlug,
     });
 
     const report = await cacheGet(env, CACHE_KEY);
