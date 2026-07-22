@@ -148,7 +148,7 @@ async function fetchAndProcessAll(env, { startDate, endDate, onlyClientSlug } = 
 
       try {
         const dealerRow = await env.DB.prepare(
-          `SELECT id FROM dealers WHERE seriti_dealership_id = ? OR seriti_slug = ?`
+          `SELECT id FROM dealers WHERE LOWER(seriti_dealership_id) = LOWER(?) OR LOWER(seriti_slug) = LOWER(?)`
         ).bind(key, key).first();
 
         if (dealerRow) {
@@ -462,11 +462,18 @@ export async function handleReport(request, env, path, method, dealer) {
   // Enforce that the requested slug matches the authenticated dealer.
   const slugMatch = subPath.match(/^\/([a-z0-9-]+)\/([a-z0-9-]+)$/);
   if (slugMatch && method === 'GET') {
-    const [, clientSlug, dSlug] = slugMatch;
+    const [, rawClientSlug, rawDSlug] = slugMatch;
 
-    if (!SLUG_RE.test(clientSlug) || !SLUG_RE.test(dSlug)) {
+    if (!SLUG_RE.test(rawClientSlug) || !SLUG_RE.test(rawDSlug)) {
       return json({ error: 'Invalid slug format' }, 400);
     }
+
+    // Lowercase once, here — GUIDs may arrive in different casing depending
+    // on the source (frontend/D1 vs a stray uppercase somewhere), and every
+    // downstream comparison (D1 lookup, cache key, Seriti row matching)
+    // needs to agree on one canonical casing or they silently stop matching.
+    const clientSlug = rawClientSlug.toLowerCase();
+    const dSlug       = rawDSlug.toLowerCase();
 
     // Security: resolve access via D1's seriti_slug mapping — dSlug here is
     // Seriti's own auto-generated slug, which may differ from the D1 dealer
