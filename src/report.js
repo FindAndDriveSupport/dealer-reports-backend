@@ -113,35 +113,43 @@ async function fetchAndProcessAll(env, { startDate, endDate } = {}) {
 
   const index = [];
 
+  // Resolve every dealer's real applications count from D1 CONCURRENTLY
+  // rather than one-at-a-time inside the processing loop below — with a
+  // growing dealer count (Alpine Motors' many branches, etc.), sequential
+  // awaits here were adding up enough to risk the Worker's CPU time limit
+  // on any cache-miss (which reprocesses every dealer, not just one).
+  const overridesByClient = {};
+  if (env.DB) {
+    await Promise.all(clientNames.map(async (clientName) => {
+      const slug      = dealerSlug(clientName);
+      const dateRange = extractDateRange(clientMap[clientName]);
+      if (!dateRange) return;
+
+      try {
+        const dealerRow = await env.DB.prepare(
+          `SELECT id FROM dealers WHERE seriti_slug = ?`
+        ).bind(slug).first();
+
+        if (dealerRow) {
+          const countRow = await env.DB.prepare(
+            `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
+          ).bind(dealerRow.id, `${dateRange.from}T00:00:00`, `${dateRange.to}T23:59:59.999`).first();
+          overridesByClient[clientName] = countRow?.count ?? 0;
+          console.log(`[report] Real applications for ${clientName} (dealer_key=${dealerRow.id}): ${overridesByClient[clientName]}`);
+        }
+      } catch (d1Err) {
+        console.warn(`[report] Could not resolve policy_events count for ${clientName}: ${d1Err.message} — falling back to Seriti's SubmittedOn`);
+      }
+    }));
+  }
+
   for (const clientName of clientNames) {
     const rows      = clientMap[clientName];
     const slug      = dealerSlug(clientName);
     const dateRange = extractDateRange(rows);
 
     try {
-      // Resolve the real applications count from policy_events (D1) — the
-      // authoritative record of applications actually created in Edith,
-      // rather than trusting Seriti's own SubmittedOn flag. Baked into the
-      // calculation here so Funnel, Intent, and Lead Quality Intelligence
-      // all agree, instead of patching pieces after the fact.
-      let applicationsOverrideCount = null;
-      if (env.DB) {
-        try {
-          const dealerRow = await env.DB.prepare(
-            `SELECT id FROM dealers WHERE seriti_slug = ?`
-          ).bind(slug).first();
-
-          if (dealerRow && dateRange) {
-            const countRow = await env.DB.prepare(
-              `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
-            ).bind(dealerRow.id, `${dateRange.from}T00:00:00`, `${dateRange.to}T23:59:59.999`).first();
-            applicationsOverrideCount = countRow?.count ?? 0;
-            console.log(`[report] Real applications for ${clientName} (dealer_key=${dealerRow.id}): ${applicationsOverrideCount}`);
-          }
-        } catch (d1Err) {
-          console.warn(`[report] Could not resolve policy_events count for ${clientName}: ${d1Err.message} — falling back to Seriti's SubmittedOn`);
-        }
-      }
+      const applicationsOverrideCount = overridesByClient[clientName] ?? null;
 
       const analytics = processRows(rows, {
         clientName,
