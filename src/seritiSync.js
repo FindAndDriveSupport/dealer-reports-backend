@@ -165,3 +165,26 @@ export async function importRawRows(env, rawRows) {
   console.log(`[sync] Bulk import: ${imported} imported, ${skipped} skipped (missing applicantId)`);
   return { imported, skipped, total: rawRows.length };
 }
+
+// Deletes applicant lead data older than the retention window — keeps D1
+// storage bounded well under its 10GB cap regardless of how long this
+// system runs. Also trims seriti_sync_log, which otherwise grows one row
+// per synced day forever.
+export async function cleanupOldLeads(env, retentionDays = 90) {
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+  const cutoffDate = cutoff.toISOString().split('T')[0];
+
+  const leadsResult = await env.DB.prepare(
+    `DELETE FROM seriti_leads WHERE lead_date < ?`
+  ).bind(cutoffDate).run();
+
+  const logResult = await env.DB.prepare(
+    `DELETE FROM seriti_sync_log WHERE sync_date < ? AND sync_date != 'bulk-import'`
+  ).bind(cutoffDate).run();
+
+  const leadsDeleted = leadsResult.meta?.changes ?? 0;
+  const logDeleted   = logResult.meta?.changes ?? 0;
+
+  console.log(`[sync] Cleanup: removed ${leadsDeleted} lead(s) and ${logDeleted} sync log row(s) older than ${cutoffDate}`);
+  return { leadsDeleted, logDeleted, cutoffDate };
+}
