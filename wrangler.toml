@@ -23,10 +23,9 @@ invocation_logs = true
 [vars]
 CACHE_TTL_MINUTES = "60"
 
-# Cron Trigger temporarily removed — account is at its 5-cron-trigger limit
-# (shared across all Workers on this account, e.g. leads-api's pipeline).
-# Data still syncs fine via manual "Refresh data" on /admin in the meantime.
-# Once a slot frees up (or an existing cron gets consolidated), re-add:
-#
-# [triggers]
-# crons = ["*/30 * * * *"]
+# Background sync — pulls Seriti's and Mixpanel's data into D1 every hour,
+# day-by-day, so live dashboard requests never call either API directly.
+# Uses the single shared cron slot for BOTH syncs (this account is capped
+# at 5 total cron triggers across all Workers).
+[triggers]
+crons = ["0 * * * *"]
