@@ -48,22 +48,11 @@ async function overrideApplicationsFromPolicies(env, report, dealerId, startDate
       `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
     ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
 
-    const policyCount   = row?.count ?? 0;
-    const seritiCount   = report.funnel.applicationsSubmitted;
-
-    // policy_events is populated by a SEPARATE sync worker (Edith's SOAP
-    // status sync) that isn't always kept current for every dealer — some
-    // dealers (e.g. the whole Alpine Motors group) have gone weeks without
-    // a real sync. Blindly trusting it would silently show FEWER
-    // applications than Seriti's own SubmittedOn count actually supports.
-    // Only override when policy_events has at least as much data — i.e.
-    // only when it's genuinely more informative, never less.
-    if (policyCount < seritiCount) {
-      console.warn(`[report] Skipping policy_events override for ${dealerId} — stale/incomplete (${policyCount} policy events vs ${seritiCount} Seriti submissions)`);
-      return report;
-    }
-
-    const applicationsSubmitted = policyCount;
+    // policy_events (Edith's real policy-creation records) is the
+    // authoritative source for applications — always used, regardless of
+    // how it compares to Seriti's own SubmittedOn flag. A lower count here
+    // genuinely means fewer real applications were created, not "stale data".
+    const applicationsSubmitted = row?.count ?? 0;
     const preApprovals = report.funnel.preApprovals;
     const preApprovalToApplication = preApprovals > 0
       ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1)
@@ -237,7 +226,13 @@ export async function handleReport(request, env, path, method, dealer) {
           clientName: displayName, clientSlug: d.id, dealerName: displayName, dealerSlug: d.id,
           dateRange: { from: dates.startDate, to: dates.endDate }, source: 'd1',
         });
-        reports.push(analytics);
+        // Same policy_events floor-fix as the single-dealer route — without
+        // this, the aggregate only ever summed Seriti's own (often much
+        // lower) SubmittedOn count, missing dealers' real Edith policy data
+        // entirely and making "All Dealers"/group totals look artificially
+        // tiny compared to what individual dealer views correctly show.
+        const withOverride = await overrideApplicationsFromPolicies(env, analytics, d.id, dates.startDate, dates.endDate);
+        reports.push(withOverride);
       }
 
       if (reports.length === 0) {
@@ -399,4 +394,5 @@ export async function handleReport(request, env, path, method, dealer) {
   }
 
   return json({ error: 'Not found' }, 404);
-}
+    }
+          
