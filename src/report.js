@@ -48,7 +48,22 @@ async function overrideApplicationsFromPolicies(env, report, dealerId, startDate
       `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
     ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
 
-    const applicationsSubmitted = row?.count ?? 0;
+    const policyCount   = row?.count ?? 0;
+    const seritiCount   = report.funnel.applicationsSubmitted;
+
+    // policy_events is populated by a SEPARATE sync worker (Edith's SOAP
+    // status sync) that isn't always kept current for every dealer — some
+    // dealers (e.g. the whole Alpine Motors group) have gone weeks without
+    // a real sync. Blindly trusting it would silently show FEWER
+    // applications than Seriti's own SubmittedOn count actually supports.
+    // Only override when policy_events has at least as much data — i.e.
+    // only when it's genuinely more informative, never less.
+    if (policyCount < seritiCount) {
+      console.warn(`[report] Skipping policy_events override for ${dealerId} — stale/incomplete (${policyCount} policy events vs ${seritiCount} Seriti submissions)`);
+      return report;
+    }
+
+    const applicationsSubmitted = policyCount;
     const preApprovals = report.funnel.preApprovals;
     const preApprovalToApplication = preApprovals > 0
       ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1)
