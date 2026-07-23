@@ -183,28 +183,62 @@ async function queryPolicySummary(env, dealerKey, startDate, endDate) {
   };
 }
 
-// Sums queryPolicySummary results across a set of dealer_keys into one
-// combined shape, matching the same fields the single-dealer version returns.
+// Sums policy data across a set of dealer_keys using 4 queries TOTAL (via
+// WHERE dealer_key IN (...)) rather than 4 queries PER dealer — the
+// previous per-dealer-loop version ran 4×N queries, which was tripping
+// Cloudflare's Worker CPU time limit once the dealer count grew past ~30
+// (Alpine Motors' 27 branches pushed this well over that threshold).
 async function querySummedPolicySummary(env, dealerKeys, startDate, endDate) {
-  const perDealer = await Promise.all(
-    dealerKeys.map(k => queryPolicySummary(env, k, startDate, endDate))
-  );
-
-  const totals = [];
-  const financeStatus = [];
-  const transactionStatus = [];
-  const financeCompany = [];
-
-  for (const summary of perDealer) {
-    totals.push(...summary.totals);
-    financeStatus.push(...summary.financeStatus);
-    transactionStatus.push(...summary.transactionStatus);
-    financeCompany.push(...summary.financeCompany);
+  if (dealerKeys.length === 0) {
+    return { totals: [], financeStatus: [], transactionStatus: [], financeCompany: [] };
   }
 
-  // Collapse transaction_status and finance_company across dealers into one
-  // set of totals each (rather than listing every dealer's rows separately),
-  // since this is an aggregate ("totals only") view.
+  const hasDateRange = !!(startDate && endDate);
+  const dateClause = hasDateRange ? `AND created_at >= ? AND created_at <= ?` : '';
+  const dateParams = hasDateRange ? [`${startDate}T00:00:00`, `${endDate}T23:59:59.999`] : [];
+  const placeholders = dealerKeys.map(() => '?').join(', ');
+
+  const totalsResult = await env.DB.prepare(`
+    SELECT
+      dealer_key, finance_type,
+      COUNT(*) as total_policies,
+      COUNT(CASE WHEN finance_status = 'PAID OUT' THEN 1 END) as paid_out,
+      COUNT(CASE WHEN finance_status = 'DECLINED' THEN 1 END) as declined,
+      COUNT(CASE WHEN transaction_status = 'DELIVERED' THEN 1 END) as delivered,
+      COUNT(CASE WHEN transaction_status = 'DUPLICATE DEAL' THEN 1 END) as duplicate_deals,
+      COUNT(CASE WHEN transaction_status LIKE 'AWAITING%' THEN 1 END) as awaiting_delivery
+    FROM policy_events
+    WHERE dealer_key IN (${placeholders}) ${dateClause}
+    GROUP BY dealer_key, finance_type
+  `).bind(...dealerKeys, ...dateParams).all();
+
+  const financeStatusResult = await env.DB.prepare(`
+    SELECT finance_type, finance_company, finance_status, COUNT(*) as count
+    FROM policy_events
+    WHERE dealer_key IN (${placeholders}) ${dateClause}
+    GROUP BY finance_type, finance_company, finance_status
+    ORDER BY count DESC
+  `).bind(...dealerKeys, ...dateParams).all();
+
+  const transactionStatusResult = await env.DB.prepare(`
+    SELECT transaction_status, COUNT(*) as count
+    FROM policy_events
+    WHERE dealer_key IN (${placeholders}) ${dateClause}
+    GROUP BY transaction_status
+    ORDER BY count DESC
+  `).bind(...dealerKeys, ...dateParams).all();
+
+  const financeCompanyResult = await env.DB.prepare(`
+    SELECT finance_company, COUNT(*) as count,
+      COUNT(CASE WHEN finance_status = 'PAID OUT' THEN 1 END) as paid_out
+    FROM policy_events
+    WHERE dealer_key IN (${placeholders}) AND finance_company IS NOT NULL ${dateClause}
+    GROUP BY finance_company
+    ORDER BY count DESC
+  `).bind(...dealerKeys, ...dateParams).all();
+
+  // Collapse transaction_status and finance_company into one set of totals
+  // each (rather than per-dealer rows), since this is an aggregate view.
   const collapseByKey = (rows, key, extraSumKeys = []) => {
     const map = new Map();
     for (const row of rows) {
@@ -220,10 +254,10 @@ async function querySummedPolicySummary(env, dealerKeys, startDate, endDate) {
   };
 
   return {
-    totals, // per-dealer-per-financeType rows — frontend already sums these into KPIs
-    financeStatus:     collapseByKey(financeStatus, 'finance_status'),
-    transactionStatus: collapseByKey(transactionStatus, 'transaction_status'),
-    financeCompany:    collapseByKey(financeCompany, 'finance_company', ['paid_out']),
+    totals:            totalsResult.results || [], // per-dealer-per-financeType rows — frontend sums these into KPIs
+    financeStatus:     collapseByKey(financeStatusResult.results || [], 'finance_status'),
+    transactionStatus: collapseByKey(transactionStatusResult.results || [], 'transaction_status'),
+    financeCompany:    financeCompanyResult.results || [],
   };
 }
 
