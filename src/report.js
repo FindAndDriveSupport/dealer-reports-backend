@@ -20,6 +20,7 @@
 
 import { testConnection } from './seritiApiService.js';
 import { syncDateRange, importRawRows, cleanupOldLeads } from './seritiSync.js';
+import { syncMixpanelDateRange, cleanupOldMixpanelEvents } from './mixpanelSync.js';
 import { processRows, getGrade } from './metricsProcessor.js';
 import { json } from './index.js';
 import { getAccessibleDealerRows, canAccessSeritiSlug } from './dealers.js';
@@ -110,6 +111,28 @@ export async function handleReport(request, env, path, method, dealer) {
     }
   }
 
+  // POST /api/report/refresh-mixpanel — manual on-demand Mixpanel sync,
+  // same day-by-day pattern as Seriti's /refresh. Admin only.
+  if (subPath === '/refresh-mixpanel' && method === 'POST') {
+    if (!dealer?.isAdmin) return json({ error: 'Forbidden — admin access only' }, 403);
+
+    const dates = (queryParams.startDate && queryParams.endDate)
+      ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
+      : defaultDateRange();
+
+    try {
+      const result = await syncMixpanelDateRange(env, dates.startDate, dates.endDate);
+      return json({
+        success: true,
+        message: `Synced ${result.totalEvents} event(s) across ${result.days} day(s)${result.failures > 0 ? ` (${result.failures} day(s) failed — check logs)` : ''}`,
+        ...result,
+      });
+    } catch (err) {
+      console.error('[report] mixpanel refresh failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
   // POST /api/report/import — bulk-load a pre-fetched Seriti JSON export
   // directly into D1, skipping live Seriti calls entirely. Body is the raw
   // JSON array exactly as Seriti's /Reporting endpoint returns it. Admin only.
@@ -137,11 +160,13 @@ export async function handleReport(request, env, path, method, dealer) {
 
     try {
       const retentionDays = queryParams.retentionDays ? parseInt(queryParams.retentionDays, 10) : 90;
-      const result = await cleanupOldLeads(env, retentionDays);
+      const leadsResult     = await cleanupOldLeads(env, retentionDays);
+      const mixpanelResult  = await cleanupOldMixpanelEvents(env, retentionDays);
       return json({
         success: true,
-        message: `Removed ${result.leadsDeleted} lead(s) older than ${result.cutoffDate}`,
-        ...result,
+        message: `Removed ${leadsResult.leadsDeleted} lead(s) and ${mixpanelResult.deleted} Mixpanel event(s) older than ${leadsResult.cutoffDate}`,
+        leads: leadsResult,
+        mixpanel: mixpanelResult,
       });
     } catch (err) {
       console.error('[report] cleanup failed:', err.message);
