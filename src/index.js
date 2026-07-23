@@ -18,6 +18,7 @@ import { handleAuth }     from './auth.js';
 import { handleDealers }  from './dealers.js';
 import { withAuth }       from './middleware/auth.js';
 import { scheduledSync, cleanupOldLeads } from './seritiSync.js';
+import { scheduledMixpanelSync, cleanupOldMixpanelEvents } from './mixpanelSync.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -139,7 +140,13 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       scheduledSync(env, 3).catch(err => {
-        console.error('[scheduled] sync failed:', err.message);
+        console.error('[scheduled] Seriti sync failed:', err.message);
+      })
+    );
+
+    ctx.waitUntil(
+      scheduledMixpanelSync(env, 3).catch(err => {
+        console.error('[scheduled] Mixpanel sync failed:', err.message);
       })
     );
 
@@ -150,6 +157,7 @@ export default {
         if (lastCleanup === today) return; // already ran today
 
         await cleanupOldLeads(env, 90);
+        await cleanupOldMixpanelEvents(env, 90);
         await env.CACHE.put('last_cleanup_date', today, { expirationTtl: 7 * 24 * 60 * 60 });
       } catch (err) {
         console.error('[scheduled] cleanup failed:', err.message);
