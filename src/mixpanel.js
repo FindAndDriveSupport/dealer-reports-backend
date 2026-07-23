@@ -23,7 +23,7 @@ const CACHE_TTL  = 60 * 60; // 1 hour
 
 const MAX_EVENTS = 50000; // safety cap on MATCHING events, not raw export size
 
-async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
+export async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
   const secret = env.MIXPANEL_API_SECRET;
   if (!secret) throw new Error('MIXPANEL_API_SECRET is not set');
 
@@ -46,9 +46,10 @@ async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
   const events  = [];
   const reader  = res.body.getReader();
   const decoder = new TextDecoder();
-  let   buffer     = '';
-  let   truncated  = false;
-  let   totalSeen  = 0;
+  let   buffer      = '';
+  let   truncated   = false;
+  let   totalSeen   = 0;
+  let   preFiltered = 0; // lines skipped without ever calling JSON.parse
 
   // Tracked URLs reflect the dealer's own website domain (or the
   // seritifinance.findndrive.co.za subdomain) — Seriti branch codes never
@@ -56,7 +57,17 @@ async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
   // Seriti/Edith only. domainList is comma-separated; match any.
   const domains = (domainList || '').split(',').map(d => d.trim()).filter(Boolean);
 
-  const matches = (parsed) => {
+  // Cheap raw-text pre-filter — checked BEFORE any JSON parsing. The domain
+  // has to appear as literal text in the JSON for the event to ever match,
+  // so if it's not there at all, skip straight to the next line with zero
+  // parse cost. This is what actually keeps CPU cost proportional to
+  // matching events, not total account volume.
+  const rawLikelyMatch = (line) => {
+    if (domains.length === 0) return true;
+    return domains.some(d => line.includes(d));
+  };
+
+  const preciseMatch = (parsed) => {
     if (domains.length === 0) return true;
     const url = parsed.properties?.current_url_search || parsed.properties?.['$current_url'] || '';
     return domains.some(d => url.includes(d));
@@ -66,9 +77,15 @@ async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
     const trimmed = line.trim();
     if (!trimmed) return;
     totalSeen++;
+
+    if (!rawLikelyMatch(trimmed)) {
+      preFiltered++;
+      return; // never touches JSON.parse
+    }
+
     try {
       const parsed = JSON.parse(trimmed);
-      if (matches(parsed)) events.push(parsed);
+      if (preciseMatch(parsed)) events.push(parsed);
     } catch { /* skip malformed line */ }
   };
 
@@ -97,6 +114,8 @@ async function fetchRawEvents(env, { startDate, endDate }, domainList = null) {
   if (truncated) {
     console.warn(`[mixpanel] Matching-event cap reached (${MAX_EVENTS}) — narrow the date range for exact figures.`);
   }
+
+  console.log(`[mixpanel] Scanned ${totalSeen} lines, pre-filtered ${preFiltered} without parsing, kept ${events.length} matching`);
 
   console.log(`[mixpanel] Scanned ${totalSeen} events, kept ${events.length} matching${domains.length ? ` domains=${domains.join('|')}` : ' (unfiltered)'}${truncated ? ' (capped)' : ''}`);
   return events;
@@ -282,14 +301,41 @@ export async function getEngagementForDomains(env, domainList, startDate, endDat
     if (cached) return { ...JSON.parse(cached), _cached: true };
   } catch { /* cache miss */ }
 
-  // Filtered inline during streaming — keeps memory flat regardless of
-  // total export size, avoiding Worker resource limit crashes.
-  const filtered   = await fetchRawEvents(env, dates, domainList);
-  const engagement = processEvents(filtered);
+  // Reads from D1 (populated by mixpanelSync.js on a schedule) instead of
+  // calling Mixpanel's Export API live — this is what actually fixes the
+  // 524 timeouts (Mixpanel's own export taking too long to generate) and
+  // 429 rate limits (too many concurrent live calls, e.g. one per domain
+  // cluster in a group-aggregate view) we kept hitting. Mixpanel's API now
+  // only ever gets called by the background sync job, never by live
+  // dashboard traffic.
+  const domains = (domainList || '').split(',').map(d => d.trim()).filter(Boolean);
+  const events  = await getStoredEventsForDomains(env, domains, dates.startDate, dates.endDate);
+  const engagement = processEvents(events);
 
   await env.CACHE.put(cacheKey, JSON.stringify(engagement), { expirationTtl: CACHE_TTL });
 
   return { ...engagement, _cached: false };
+}
+
+// Queries D1's mixpanel_events for rows whose stored url matches any of the
+// given domains, within the date range. Mirrors the same substring-match
+// semantics fetchRawEvents used to apply live against Mixpanel's export.
+async function getStoredEventsForDomains(env, domains, startDate, endDate) {
+  if (!env.DB) return [];
+
+  let query  = `SELECT data FROM mixpanel_events WHERE event_date >= ? AND event_date <= ?`;
+  const bind = [startDate, endDate];
+
+  if (domains.length > 0) {
+    const clauses = domains.map(() => `url LIKE ?`).join(' OR ');
+    query += ` AND (${clauses})`;
+    bind.push(...domains.map(d => `%${d}%`));
+  }
+
+  const result = await env.DB.prepare(query).bind(...bind).all();
+  return (result.results || []).map(r => {
+    try { return JSON.parse(r.data); } catch { return null; }
+  }).filter(Boolean);
 }
 
 export async function getEngagementForDealer(env, dealerId, startDate, endDate) {
