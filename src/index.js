@@ -17,7 +17,7 @@ import { handleAdmin }    from './admin.js';
 import { handleAuth }     from './auth.js';
 import { handleDealers }  from './dealers.js';
 import { withAuth }       from './middleware/auth.js';
-import { scheduledSync }  from './seritiSync.js';
+import { scheduledSync, cleanupOldLeads } from './seritiSync.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -126,16 +126,35 @@ export default {
     }
   },
 
-  // Cron Trigger — background sync of Seriti's data into D1, day by day.
-  // Configure the schedule in wrangler.toml, e.g.:
+  // Cron Trigger — background sync of Seriti's data into D1, day by day,
+  // plus a once-daily cleanup of applicant data older than 90 days (keeps
+  // D1 storage well under its 10GB cap). Configure the schedule in
+  // wrangler.toml, e.g.:
   //   [triggers]
   //   crons = ["*/30 * * * *"]   # every 30 minutes
+  //
+  // Cleanup only actually runs once per UTC day, not every tick — tracked
+  // via a KV timestamp, since this account is at its 5-cron-trigger limit
+  // and can't spare a separate trigger just for cleanup timing.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       scheduledSync(env, 3).catch(err => {
         console.error('[scheduled] sync failed:', err.message);
       })
     );
+
+    ctx.waitUntil((async () => {
+      try {
+        const today = new Date().toISOString().split('T')[0];
+        const lastCleanup = await env.CACHE.get('last_cleanup_date');
+        if (lastCleanup === today) return; // already ran today
+
+        await cleanupOldLeads(env, 90);
+        await env.CACHE.put('last_cleanup_date', today, { expirationTtl: 7 * 24 * 60 * 60 });
+      } catch (err) {
+        console.error('[scheduled] cleanup failed:', err.message);
+      }
+    })());
   },
 };
 
