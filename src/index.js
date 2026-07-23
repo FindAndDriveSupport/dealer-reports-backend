@@ -132,7 +132,7 @@ export default {
   // D1 storage well under its 10GB cap). Configure the schedule in
   // wrangler.toml, e.g.:
   //   [triggers]
-  //   crons = ["*/30 * * * *"]   # every 30 minutes
+  //   crons = ["0 * * * *"]   # every hour, on the hour
   //
   // Cleanup only actually runs once per UTC day, not every tick — tracked
   // via a KV timestamp, since this account is at its 5-cron-trigger limit
