@@ -240,6 +240,27 @@ export async function handleDealers(request, env, path, method, dealer) {
     try {
       const dealers = await getAccessibleDealerRows(env, dealer);
 
+      // Distinct groups among the dealers this user can see — each becomes
+      // a selectable "view by group" aggregate option in the dealer
+      // switcher, sitting between "All Dealers" and individual dealers.
+      const groupMap = new Map();
+      for (const d of dealers) {
+        if (d.group_id && !groupMap.has(d.group_id)) {
+          groupMap.set(d.group_id, { id: d.group_id, name: d.group_id });
+        }
+      }
+      // Resolve real group display names from the groups table
+      if (groupMap.size > 0) {
+        const groupIds = [...groupMap.keys()];
+        const placeholders = groupIds.map(() => '?').join(', ');
+        const groupRows = await env.DB.prepare(
+          `SELECT id, name FROM groups WHERE id IN (${placeholders})`
+        ).bind(...groupIds).all();
+        for (const g of (groupRows.results || [])) {
+          if (groupMap.has(g.id)) groupMap.set(g.id, { id: g.id, name: g.name });
+        }
+      }
+
       return json({
         dealers: dealers.map(d => ({
           id:          d.id,
@@ -252,6 +273,7 @@ export async function handleDealers(request, env, path, method, dealer) {
           // identifier and just passes it straight through to the backend.
           seritiSlug:  d.seriti_dealership_id || d.seriti_slug || null,
         })),
+        groups: [...groupMap.values()],
         canSwitchDealer: dealer.isAdmin || !!dealer.groupId,
       });
     } catch (err) {
@@ -264,7 +286,18 @@ export async function handleDealers(request, env, path, method, dealer) {
   // but branch users technically only ever have one accessible dealer anyway so this is safe.
   if (subPath === '/all/policies' && method === 'GET') {
     try {
-      const dealers = await getAccessibleDealerRows(env, dealer);
+      let dealers = await getAccessibleDealerRows(env, dealer);
+
+      // Optional ?groupId= narrows the aggregate to just one dealer group
+      // (e.g. "Alpine Motors") instead of everything the user can access.
+      const groupId = url.searchParams.get('groupId');
+      if (groupId) {
+        dealers = dealers.filter(d => d.group_id === groupId);
+        if (dealers.length === 0) {
+          return json({ error: `No accessible dealers found in group "${groupId}"` }, 404);
+        }
+      }
+
       const dealerKeys = dealers.map(d => d.id);
 
       const startDate = url.searchParams.get('startDate');
@@ -272,7 +305,7 @@ export async function handleDealers(request, env, path, method, dealer) {
 
       const summary = await querySummedPolicySummary(env, dealerKeys, startDate, endDate);
       return json({
-        dealerKey: 'all',
+        dealerKey: groupId ? `group:${groupId}` : 'all',
         dealerCount: dealerKeys.length,
         dateRange: startDate && endDate ? { from: startDate, to: endDate } : null,
         ...summary,
@@ -282,10 +315,19 @@ export async function handleDealers(request, env, path, method, dealer) {
     }
   }
 
-  // GET /api/dealers/all/engagement?startDate=&endDate= — summed across every accessible dealer
+  // GET /api/dealers/all/engagement?startDate=&endDate=&groupId= — summed across accessible (or one group's) dealers
   if (subPath === '/all/engagement' && method === 'GET') {
     try {
-      const dealers = await getAccessibleDealerRows(env, dealer);
+      let dealers = await getAccessibleDealerRows(env, dealer);
+
+      const groupId = url.searchParams.get('groupId');
+      if (groupId) {
+        dealers = dealers.filter(d => d.group_id === groupId);
+        if (dealers.length === 0) {
+          return json({ error: `No accessible dealers found in group "${groupId}"` }, 404);
+        }
+      }
+
       const startDate = url.searchParams.get('startDate');
       const endDate   = url.searchParams.get('endDate');
 
