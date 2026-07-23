@@ -19,7 +19,7 @@
  */
 
 import { testConnection } from './seritiApiService.js';
-import { syncDateRange, importRawRows } from './seritiSync.js';
+import { syncDateRange, importRawRows, cleanupOldLeads } from './seritiSync.js';
 import { processRows, getGrade } from './metricsProcessor.js';
 import { json } from './index.js';
 import { getAccessibleDealerRows, canAccessSeritiSlug } from './dealers.js';
@@ -126,6 +126,25 @@ export async function handleReport(request, env, path, method, dealer) {
       });
     } catch (err) {
       console.error('[report] import failed:', err.message);
+      return json({ error: err.message }, 500);
+    }
+  }
+
+  // POST /api/report/cleanup — manual on-demand cleanup, in case you don't
+  // want to wait for the daily cron-triggered cleanup. Admin only.
+  if (subPath === '/cleanup' && method === 'POST') {
+    if (!dealer?.isAdmin) return json({ error: 'Forbidden — admin access only' }, 403);
+
+    try {
+      const retentionDays = queryParams.retentionDays ? parseInt(queryParams.retentionDays, 10) : 90;
+      const result = await cleanupOldLeads(env, retentionDays);
+      return json({
+        success: true,
+        message: `Removed ${result.leadsDeleted} lead(s) older than ${result.cutoffDate}`,
+        ...result,
+      });
+    } catch (err) {
+      console.error('[report] cleanup failed:', err.message);
       return json({ error: err.message }, 500);
     }
   }
