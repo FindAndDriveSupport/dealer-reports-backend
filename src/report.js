@@ -66,10 +66,21 @@ async function overrideApplicationsFromPolicies(env, report, dealerId, startDate
 }
 
 // Fetch one dealer's normalized lead rows from D1 for a date range.
-async function getDealerRowsFromD1(env, dealerKey, startDate, endDate) {
+// Some of a dealer's leads may have a Seriti dealershipId and others may
+// not (depending on whether that particular lead had a dealership assigned
+// in Seriti's system at capture time) — meaning the SAME real dealer can
+// end up split across two different dealer_key values in D1 (one GUID-
+// based, one slug-based). Querying by only one key silently loses whichever
+// rows landed under the other. This accepts a list of possible keys for a
+// dealer and queries all of them.
+async function getDealerRowsFromD1(env, dealerKeys, startDate, endDate) {
+  const keys = Array.isArray(dealerKeys) ? dealerKeys.filter(Boolean) : [dealerKeys].filter(Boolean);
+  if (keys.length === 0) return [];
+
+  const placeholders = keys.map(() => '?').join(', ');
   const result = await env.DB.prepare(
-    `SELECT data FROM seriti_leads WHERE dealer_key = ? AND lead_date >= ? AND lead_date <= ?`
-  ).bind(dealerKey, startDate, endDate).all();
+    `SELECT data FROM seriti_leads WHERE dealer_key IN (${placeholders}) AND lead_date >= ? AND lead_date <= ?`
+  ).bind(...keys, startDate, endDate).all();
 
   return (result.results || []).map(r => {
     try { return JSON.parse(r.data); } catch { return null; }
@@ -184,19 +195,21 @@ export async function handleReport(request, env, path, method, dealer) {
         ? { startDate: queryParams.startDate, endDate: queryParams.endDate }
         : defaultDateRange();
 
-      const dealerRows  = await getAccessibleDealerRows(env, dealer);
-      const dealerKeys  = dealerRows.flatMap(d => [d.seriti_dealership_id, d.seriti_slug].filter(Boolean));
+      const dealerRows = await getAccessibleDealerRows(env, dealer);
 
-      if (dealerKeys.length === 0) {
+      if (dealerRows.length === 0) {
         return json({ error: 'No dealers found for this user' }, 404);
       }
 
       const reports = [];
-      for (const key of dealerKeys) {
-        const rows = await getDealerRowsFromD1(env, key, dates.startDate, dates.endDate);
+      for (const d of dealerRows) {
+        const keys = [d.seriti_dealership_id, d.seriti_slug].filter(Boolean);
+        if (keys.length === 0) continue;
+        const rows = await getDealerRowsFromD1(env, keys, dates.startDate, dates.endDate);
         if (rows.length === 0) continue;
+        const displayName = rows[0]?.ClientName || d.name;
         const analytics = processRows(rows, {
-          clientName: key, clientSlug: key, dealerName: key, dealerSlug: key,
+          clientName: displayName, clientSlug: d.id, dealerName: displayName, dealerSlug: d.id,
           dateRange: dates, source: 'd1',
         });
         reports.push(analytics);
@@ -321,7 +334,20 @@ export async function handleReport(request, env, path, method, dealer) {
       : defaultDateRange();
 
     try {
-      const rows = await getDealerRowsFromD1(env, dSlug, dates.startDate, dates.endDate);
+      // Resolve BOTH known keys for this dealer (GUID + legacy slug) — a
+      // dealer's leads can be split across both in seriti_leads depending
+      // on whether Seriti had a dealershipId assigned at capture time for
+      // each individual lead. Querying only the URL's slug would silently
+      // miss whichever rows landed under the other key.
+      const dealerRow = await env.DB.prepare(
+        `SELECT seriti_dealership_id, seriti_slug FROM dealers WHERE LOWER(seriti_dealership_id) = LOWER(?) OR LOWER(seriti_slug) = LOWER(?)`
+      ).bind(dSlug, dSlug).first();
+
+      const keys = dealerRow
+        ? [dealerRow.seriti_dealership_id, dealerRow.seriti_slug].filter(Boolean)
+        : [dSlug];
+
+      const rows = await getDealerRowsFromD1(env, keys, dates.startDate, dates.endDate);
 
       if (rows.length === 0) {
         return json({
