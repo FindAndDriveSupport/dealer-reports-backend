@@ -267,14 +267,33 @@ function defaultDateRange() {
 // Used by dealers.js's /api/dealers/:id/engagement route — access-checked,
 // D1-based, fully independent of Seriti's report index.
 
-export async function getEngagementForDealer(env, dealerId, startDate, endDate) {
+// Core fetch+filter+process, keyed by an explicit domain list rather than a
+// single dealer id. Used directly by getEngagementForDealer() below, and
+// separately by dealers.js's group-aggregate route to fetch ONCE per
+// cluster of dealers sharing a real website (e.g. all 6 BYD branches share
+// bydkzn.co.za) instead of once per dealer — which would otherwise count
+// that shared traffic once per sibling branch.
+export async function getEngagementForDomains(env, domainList, startDate, endDate, cacheKeySuffix = null) {
   const dates = (startDate && endDate) ? { startDate, endDate } : defaultDateRange();
 
-  const cacheKey = `mixpanel:${dealerId}:${dates.startDate}:${dates.endDate}`;
+  const cacheKey = `mixpanel:domains:${cacheKeySuffix || domainList || 'none'}:${dates.startDate}:${dates.endDate}`;
   try {
     const cached = await env.CACHE.get(cacheKey);
     if (cached) return { ...JSON.parse(cached), _cached: true };
   } catch { /* cache miss */ }
+
+  // Filtered inline during streaming — keeps memory flat regardless of
+  // total export size, avoiding Worker resource limit crashes.
+  const filtered   = await fetchRawEvents(env, dates, domainList);
+  const engagement = processEvents(filtered);
+
+  await env.CACHE.put(cacheKey, JSON.stringify(engagement), { expirationTtl: CACHE_TTL });
+
+  return { ...engagement, _cached: false };
+}
+
+export async function getEngagementForDealer(env, dealerId, startDate, endDate) {
+  const dates = (startDate && endDate) ? { startDate, endDate } : defaultDateRange();
 
   // Look up the dealer's website domain(s) from D1 — set during onboarding.
   // Tracked URLs reflect the domain, not a Seriti branch code.
@@ -286,14 +305,7 @@ export async function getEngagementForDealer(env, dealerId, startDate, endDate) 
     domainList = row?.domain || null;
   }
 
-  // Filtered inline during streaming — keeps memory flat regardless of
-  // total export size, avoiding Worker resource limit crashes.
-  const filtered   = await fetchRawEvents(env, dates, domainList);
-  const engagement = processEvents(filtered);
-
-  await env.CACHE.put(cacheKey, JSON.stringify(engagement), { expirationTtl: CACHE_TTL });
-
-  return { ...engagement, _cached: false };
+  return getEngagementForDomains(env, domainList, startDate, endDate, dealerId);
 }
 
 // ─── Legacy route handler (kept for backward compatibility) ──────────────────
