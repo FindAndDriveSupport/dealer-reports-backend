@@ -154,6 +154,8 @@ export async function handleReport(request, env, path, method, dealer) {
         ORDER BY display_name
       `).bind(dates.startDate, dates.endDate).all();
 
+      const dateRangeObj = { from: dates.startDate, to: dates.endDate };
+
       const allDealers = (result.results || []).map(r => ({
         dealerName:  r.display_name || r.dealer_key,
         dealerSlug:  r.dealer_key,
@@ -161,7 +163,7 @@ export async function handleReport(request, env, path, method, dealer) {
         clientSlug:  r.dealer_key,
         financeType: (r.display_name || '').toUpperCase().includes('YONDA') ? 'bike' : 'vehicle',
         totalLeads:  r.totalLeads,
-        dateRange:   dates,
+        dateRange:   dateRangeObj,
         processedAt: r.processedAt,
       }));
 
@@ -179,7 +181,7 @@ export async function handleReport(request, env, path, method, dealer) {
         generatedAt:  new Date().toISOString(),
         totalClients: scopedDealers.length,
         totalDealers: scopedDealers.length,
-        dateRange:    dates,
+        dateRange:    dateRangeObj,
         dealers:      scopedDealers,
       });
     } catch (err) {
@@ -218,7 +220,7 @@ export async function handleReport(request, env, path, method, dealer) {
         const displayName = rows[0]?.ClientName || d.name;
         const analytics = processRows(rows, {
           clientName: displayName, clientSlug: d.id, dealerName: displayName, dealerSlug: d.id,
-          dateRange: dates, source: 'd1',
+          dateRange: { from: dates.startDate, to: dates.endDate }, source: 'd1',
         });
         reports.push(analytics);
       }
@@ -304,7 +306,7 @@ export async function handleReport(request, env, path, method, dealer) {
         meta: {
           processedAt: new Date().toISOString(),
           totalRows: reports.reduce((a, r) => a + (r.meta?.totalRows || 0), 0),
-          dateRange: dates,
+          dateRange: { from: dates.startDate, to: dates.endDate },
           clientName: groupId ? `${groupId} (group)` : 'All dealers', clientSlug: groupId ? `group:${groupId}` : 'all',
           dealerName: groupId ? `${groupId} (group)` : 'All dealers', dealerSlug: groupId ? `group:${groupId}` : 'all',
           source: 'aggregate',
@@ -368,7 +370,7 @@ export async function handleReport(request, env, path, method, dealer) {
       const analytics = processRows(rows, {
         clientName: displayName, clientSlug: dSlug,
         dealerName: displayName, dealerSlug: dSlug,
-        dateRange: dates, source: 'd1',
+        dateRange: { from: dates.startDate, to: dates.endDate }, source: 'd1',
       });
 
       const d1DealerId = queryParams.dealerId || null;
