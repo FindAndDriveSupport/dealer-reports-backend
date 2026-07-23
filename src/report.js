@@ -35,35 +35,24 @@ function defaultDateRange() {
   };
 }
 
-// Applications on the Funnel/Dashboard come from policy_events (Edith's
-// real policy-creation records) — the authoritative source, always used
-// regardless of how it compares to Seriti's own SubmittedOn flag.
-async function overrideApplicationsFromPolicies(env, report, dealerId, startDate, endDate) {
-  if (!env.DB || !dealerId) return report;
-
-  const from = startDate || report.meta?.dateRange?.from;
-  const to   = endDate   || report.meta?.dateRange?.to;
-  if (!from || !to) return report;
-
+// Resolves the real applications count from policy_events (Edith's real
+// policy-creation records) BEFORE processRows() runs, so it can be threaded
+// through via applicationsOverrideCount — metricsProcessor.js already
+// propagates this consistently into Funnel, Intent, AND Lead Quality
+// Intelligence in one pass. Patching funnel/intent AFTER processRows had
+// already computed Lead Quality Intelligence from Seriti's native count
+// left that section out of sync with Funnel — same class of bug fixed once
+// before, reintroduced during the D1 rewrite.
+async function getApplicationsOverrideCount(env, dealerId, startDate, endDate) {
+  if (!env.DB || !dealerId) return null;
   try {
     const row = await env.DB.prepare(
       `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
-    ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
-
-    const applicationsSubmitted = row?.count ?? 0;
-    const preApprovals = report.funnel.preApprovals;
-    const preApprovalToApplication = preApprovals > 0
-      ? +((applicationsSubmitted / preApprovals) * 100).toFixed(1)
-      : 0;
-
-    return {
-      ...report,
-      funnel: { ...report.funnel, applicationsSubmitted, preApprovalToApplication },
-      intent: { ...report.intent, highIntent: applicationsSubmitted },
-    };
+    ).bind(dealerId, `${startDate}T00:00:00`, `${endDate}T23:59:59.999`).first();
+    return row?.count ?? 0;
   } catch (err) {
-    console.error('[report] policy override failed:', err.message);
-    return report;
+    console.error('[report] applications override lookup failed:', err.message);
+    return null;
   }
 }
 
@@ -220,12 +209,13 @@ export async function handleReport(request, env, path, method, dealer) {
         const rows = await getDealerRowsFromD1(env, keys, dates.startDate, dates.endDate);
         if (rows.length === 0) continue;
         const displayName = rows[0]?.ClientName || d.name;
+        const applicationsOverrideCount = await getApplicationsOverrideCount(env, d.id, dates.startDate, dates.endDate);
         const analytics = processRows(rows, {
           clientName: displayName, clientSlug: d.id, dealerName: displayName, dealerSlug: d.id,
           dateRange: { from: dates.startDate, to: dates.endDate }, source: 'd1',
+          applicationsOverrideCount,
         });
-        const withOverride = await overrideApplicationsFromPolicies(env, analytics, d.id, dates.startDate, dates.endDate);
-        reports.push(withOverride);
+        reports.push(analytics);
       }
 
       if (reports.length === 0) {
@@ -370,16 +360,16 @@ export async function handleReport(request, env, path, method, dealer) {
       }
 
       const displayName = rows[0]?.ClientName || dSlug;
+      const d1DealerId = queryParams.dealerId || null;
+      const applicationsOverrideCount = await getApplicationsOverrideCount(env, d1DealerId, dates.startDate, dates.endDate);
       const analytics = processRows(rows, {
         clientName: displayName, clientSlug: dSlug,
         dealerName: displayName, dealerSlug: dSlug,
         dateRange: { from: dates.startDate, to: dates.endDate }, source: 'd1',
+        applicationsOverrideCount,
       });
 
-      const d1DealerId = queryParams.dealerId || null;
-      const withOverride = await overrideApplicationsFromPolicies(env, analytics, d1DealerId, dates.startDate, dates.endDate);
-
-      return json({ ...withOverride, _cached: false });
+      return json({ ...analytics, _cached: false });
     } catch (err) {
       console.error('[report] dealer report failed:', err.message);
       return json({ error: err.message }, 500);
@@ -387,5 +377,4 @@ export async function handleReport(request, env, path, method, dealer) {
   }
 
   return json({ error: 'Not found' }, 404);
-      }
-    
+}
