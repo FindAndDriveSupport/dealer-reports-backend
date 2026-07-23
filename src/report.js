@@ -35,7 +35,9 @@ function defaultDateRange() {
   };
 }
 
-// Applications override — real policy_events count from D1, same as before.
+// Applications on the Funnel/Dashboard come from policy_events (Edith's
+// real policy-creation records) — the authoritative source, always used
+// regardless of how it compares to Seriti's own SubmittedOn flag.
 async function overrideApplicationsFromPolicies(env, report, dealerId, startDate, endDate) {
   if (!env.DB || !dealerId) return report;
 
@@ -48,10 +50,6 @@ async function overrideApplicationsFromPolicies(env, report, dealerId, startDate
       `SELECT COUNT(*) as count FROM policy_events WHERE dealer_key = ? AND created_at >= ? AND created_at <= ?`
     ).bind(dealerId, `${from}T00:00:00`, `${to}T23:59:59.999`).first();
 
-    // policy_events (Edith's real policy-creation records) is the
-    // authoritative source for applications — always used, regardless of
-    // how it compares to Seriti's own SubmittedOn flag. A lower count here
-    // genuinely means fewer real applications were created, not "stale data".
     const applicationsSubmitted = row?.count ?? 0;
     const preApprovals = report.funnel.preApprovals;
     const preApprovalToApplication = preApprovals > 0
@@ -226,11 +224,6 @@ export async function handleReport(request, env, path, method, dealer) {
           clientName: displayName, clientSlug: d.id, dealerName: displayName, dealerSlug: d.id,
           dateRange: { from: dates.startDate, to: dates.endDate }, source: 'd1',
         });
-        // Same policy_events floor-fix as the single-dealer route — without
-        // this, the aggregate only ever summed Seriti's own (often much
-        // lower) SubmittedOn count, missing dealers' real Edith policy data
-        // entirely and making "All Dealers"/group totals look artificially
-        // tiny compared to what individual dealer views correctly show.
         const withOverride = await overrideApplicationsFromPolicies(env, analytics, d.id, dates.startDate, dates.endDate);
         reports.push(withOverride);
       }
@@ -394,5 +387,5 @@ export async function handleReport(request, env, path, method, dealer) {
   }
 
   return json({ error: 'Not found' }, 404);
-    }
-          
+      }
+    
