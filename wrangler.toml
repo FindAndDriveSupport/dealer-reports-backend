@@ -11,6 +11,10 @@ id      = "5af14d5eab9f41f38a34cbc245c73f30"
 binding = "TOKENS"
 id      = "8e28939fbbe44d019afbd4e774626d32"
 
+[[kv_namespaces]]
+binding = "LEADS_SYNC_CONFIG"
+id      = "352dc4a8e9244b88b315a12590fd6a1a"
+
 [[d1_databases]]
 binding      = "DB"
 database_name = "postal-codes-db"
@@ -29,3 +33,4 @@ CACHE_TTL_MINUTES = "60"
 # at 5 total cron triggers across all Workers).
 [triggers]
 crons = ["0 * * * *"]
+
