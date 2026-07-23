@@ -197,12 +197,20 @@ export async function handleReport(request, env, path, method, dealer) {
 
       const dealerRows = await getAccessibleDealerRows(env, dealer);
 
-      if (dealerRows.length === 0) {
-        return json({ error: 'No dealers found for this user' }, 404);
+      // Optional ?groupId= narrows this to just one dealer group instead
+      // of everything the user can access — powers "view by group" (e.g.
+      // Alpine Motors) alongside the existing "All Dealers" aggregate.
+      const groupId = queryParams.groupId || null;
+      const scopedDealerRows = groupId
+        ? dealerRows.filter(d => d.group_id === groupId)
+        : dealerRows;
+
+      if (scopedDealerRows.length === 0) {
+        return json({ error: groupId ? `No accessible dealers found in group "${groupId}"` : 'No dealers found for this user' }, 404);
       }
 
       const reports = [];
-      for (const d of dealerRows) {
+      for (const d of scopedDealerRows) {
         const keys = [d.seriti_dealership_id, d.seriti_slug].filter(Boolean);
         if (keys.length === 0) continue;
         const rows = await getDealerRowsFromD1(env, keys, dates.startDate, dates.endDate);
@@ -297,8 +305,8 @@ export async function handleReport(request, env, path, method, dealer) {
           processedAt: new Date().toISOString(),
           totalRows: reports.reduce((a, r) => a + (r.meta?.totalRows || 0), 0),
           dateRange: dates,
-          clientName: 'All dealers', clientSlug: 'all',
-          dealerName: 'All dealers', dealerSlug: 'all',
+          clientName: groupId ? `${groupId} (group)` : 'All dealers', clientSlug: groupId ? `group:${groupId}` : 'all',
+          dealerName: groupId ? `${groupId} (group)` : 'All dealers', dealerSlug: groupId ? `group:${groupId}` : 'all',
           source: 'aggregate',
         },
         funnel, incomeDistribution, incomeGroups, leadQualityIntelligence, intent,
