@@ -17,7 +17,7 @@
  */
 
 import { json } from './index.js';
-import { getEngagementForDealer } from './mixpanel.js';
+import { getEngagementForDealer, getEngagementForDomains } from './mixpanel.js';
 
 // ── Access resolution ────────────────────────────────────────────────────────
 //
@@ -331,10 +331,44 @@ export async function handleDealers(request, env, path, method, dealer) {
       const startDate = url.searchParams.get('startDate');
       const endDate   = url.searchParams.get('endDate');
 
-      const perDealer = await Promise.all(
-        dealers.map(d => getEngagementForDealer(env, d.id, startDate, endDate).catch(() => null))
+      // Cluster dealers by their real shared domain — several branches can
+      // list the SAME external website (e.g. all 6 BYD branches list
+      // bydkzn.co.za) alongside their own always-unique
+      // {id}.seritifinance.findndrive.co.za subdomain. Fetching per-dealer
+      // would re-scan and re-count that shared domain's traffic once per
+      // sibling branch. Instead: group by the shared (non-seritifinance)
+      // domain, fetch Mixpanel ONCE per cluster using the union of every
+      // member's domain list, and sum by cluster.
+      const dealerDomains = await Promise.all(
+        dealers.map(async d => {
+          const row = await env.DB.prepare(`SELECT domain FROM dealers WHERE id = ?`).bind(d.id).first();
+          return { id: d.id, domain: row?.domain || null };
+        })
       );
-      const valid = perDealer.filter(Boolean);
+
+      const sharedDomainOf = (domainList) => {
+        if (!domainList) return null;
+        const parts = domainList.split(',').map(s => s.trim());
+        // The dealer's own subdomain always looks like "{id}.seritifinance.findndrive.co.za" —
+        // exclude those, the first remaining entry is the real shared/external site.
+        const external = parts.filter(p => !p.endsWith('.seritifinance.findndrive.co.za'));
+        return external[0] || parts[0] || null;
+      };
+
+      const clusters = new Map(); // sharedDomain -> Set of full domain-list entries across all members
+      for (const { domain } of dealerDomains) {
+        const key = sharedDomainOf(domain) || `__no-domain__:${Math.random()}`; // dealers with no domain never cluster together
+        if (!clusters.has(key)) clusters.set(key, new Set());
+        if (domain) domain.split(',').map(s => s.trim()).forEach(p => clusters.get(key).add(p));
+      }
+
+      const clusterEntries = [...clusters.entries()];
+      const perCluster = await Promise.all(
+        clusterEntries.map(([key, domainSet]) =>
+          getEngagementForDomains(env, [...domainSet].join(','), startDate, endDate, key).catch(() => null)
+        )
+      );
+      const valid = perCluster.filter(Boolean);
 
       // Sum count-based fields across dealers. returnRate/avgVisitsPerVisitor
       // are recomputed from the summed totals rather than averaged, since a
